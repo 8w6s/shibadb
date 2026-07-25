@@ -1,0 +1,39 @@
+# Build output
+build/
+build-*/
+*.o
+*.so
+*.a
+*.dylib
+
+# Test scratch
+*.lock
+test-*.tmp
+test-*.tmp.wal
+core
+core.*
+default.profraw
+
+# Editor / tooling caches
+.codegraph/
+.serena/
+.dual-graph/
+.claude/
+.xtalk/
+.mempalace/
+mempalace.yaml
+entities.json
+CONTEXT.md
+GOAL.md
+session-state.json
+.session-state.json
+
+# Legacy Python binding is maintained in a separate repository.
+/python/
+/tests/test_python_binding.py
+/tests/test_python_wheel.cmake
+/docs/PYTHON.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc

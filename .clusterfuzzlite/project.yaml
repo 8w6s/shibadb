@@ -1,0 +1,6 @@
+language: c
+primary_contact: "satoharuki@example.invalid"
+main_repo: "https://github.com/satoharuki/shibadb-c"
+sanitizers:
+  - address
+  - undefined
