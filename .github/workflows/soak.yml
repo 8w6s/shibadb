@@ -1,0 +1,95 @@
+name: Encrypted soak
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            compiler: GCC
+          - os: macos-latest
+            platform: macos
+            compiler: AppleClang
+          - os: windows-latest
+            platform: windows
+            compiler: MSVC
+    runs-on: ${{ matrix.os }}
+    env:
+      SDB_SOAK_OPERATIONS: "10000"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Ninja (Linux)
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install Ninja (macOS)
+        if: matrix.platform == 'macos'
+        run: brew install ninja
+
+      - name: Install Ninja (Windows)
+        if: matrix.platform == 'windows'
+        run: choco install ninja -y --no-progress
+
+      - name: Configure MSVC developer environment (Windows)
+        if: matrix.platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure (soak preset)
+        run: cmake --preset soak
+
+      - name: Build
+        run: cmake --build build-soak --parallel
+
+      - name: Prepare evidence directory
+        run: cmake -E make_directory stage/evidence
+
+      - name: Run encrypted soak
+        run: >
+          ctest --preset soak
+          --output-on-failure
+          --timeout 7200
+          --output-junit "${{ github.workspace }}/stage/evidence/ctest.xml"
+
+      - name: Record soak evidence
+        run: >
+          python scripts/release_evidence.py
+          --platform ${{ matrix.platform }}
+          --compiler ${{ matrix.compiler }}
+          --architecture ${{ runner.arch }}
+          --suite encrypted-soak
+          --operations 10000
+          --test-report "${{ github.workspace }}/stage/evidence/ctest.xml"
+          --output stage/evidence/soak.json
+
+      - name: Attest soak evidence
+        uses: actions/attest@v4
+        with:
+          subject-path: stage/evidence/**
+
+      - name: Upload evidence artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: soak-${{ matrix.platform }}-${{ github.sha }}
+          path: stage/evidence/
