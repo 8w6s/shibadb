@@ -105,6 +105,18 @@ run(0 out compact "${DB}")
 run(0 out scan "${DB}" users)
 expect_contains("${out}" "alice\t{role:admin}" "post-compact")
 
+# convenience verbs: exists / count / incr
+run(0 out exists "${DB}" users alice)
+expect_contains("${out}" "yes" "exists yes")
+run(3 out exists "${DB}" users ghost)   # exit 3 = absent
+expect_contains("${out}" "no" "exists no")
+run(0 out count "${DB}" users)
+expect_contains("${out}" "2" "count users")
+run(0 out incr "${DB}" counters hits)
+expect_contains("${out}" "1" "incr default 1")
+run(0 out incr "${DB}" counters hits 5)
+expect_contains("${out}" "6" "incr by 5")
+
 # --- encrypted lifecycle ---
 run(0 out create "${ENC}" --password "${PW}")
 run(0 out put "${ENC}" s k1 topsecret --password "${PW}")

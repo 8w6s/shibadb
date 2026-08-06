@@ -439,6 +439,75 @@ static int cmd_health(const char *path, const cli_options *opts) {
     return 0;
 }
 
+static int cmd_exists(const char *path, const char *ns, const char *key,
+                      const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    bool present = false;
+    st = sdb_kv_exists(db, (const uint8_t *)ns, strlen(ns),
+                       (const uint8_t *)key, strlen(key), &present);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("exists", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("exists (close)", close_st);
+    }
+    printf("%s\n", present ? "yes" : "no");
+    return present ? 0 : 3; /* 3 = absent (distinct from usage/error codes) */
+}
+
+static int cmd_count(const char *path, const char *ns,
+                     const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    const uint8_t *prefix = NULL;
+    size_t prefix_size = 0;
+    if (opts->prefix != NULL) {
+        prefix = (const uint8_t *)opts->prefix;
+        prefix_size = strlen(opts->prefix);
+    }
+    uint64_t count = 0;
+    st = sdb_kv_count_prefix(db, (const uint8_t *)ns, strlen(ns),
+                             prefix, prefix_size, &count);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("count", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("count (close)", close_st);
+    }
+    printf("%" PRIu64 "\n", count);
+    return 0;
+}
+
+static int cmd_incr(const char *path, const char *ns, const char *key,
+                    int64_t delta, const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    int64_t new_value = 0;
+    st = sdb_kv_increment(db, (const uint8_t *)ns, strlen(ns),
+                          (const uint8_t *)key, strlen(key), delta, &new_value);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("incr", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("incr (close)", close_st);
+    }
+    printf("%" PRId64 "\n", new_value);
+    return 0;
+}
+
 static int cmd_backup(const char *path, const char *dest,
                       const cli_options *opts) {
     sdb_database *db = NULL;
@@ -523,6 +592,9 @@ static int usage(FILE *out) {
 "  namespaces <file>               List populated (kind, namespace) pairs\n"
 "  verify     <file>               Deep structural verification\n"
 "  health     <file>               Open the engine and print a config snapshot\n"
+"  exists     <file> <ns> <k>      Print yes/no (exit 3 if the key is absent)\n"
+"  count      <file> <ns>          Count keys in a namespace (honours --prefix)\n"
+"  incr       <file> <ns> <k> [n]  Atomically add n (default 1) to a counter\n"
 "  backup     <file> <dest>        Atomic snapshot to a new file\n"
 "  compact    <file>               Reclaim stale space in place\n"
 "\n"
@@ -598,6 +670,18 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "health") == 0) {
         if (npos != 1) { fprintf(stderr, "shibadb: health <file>\n"); rc = 1; }
         else { rc = cmd_health(pos[0], &opts); }
+    } else if (strcmp(cmd, "exists") == 0) {
+        if (npos != 3) { fprintf(stderr, "shibadb: exists <file> <ns> <k>\n"); rc = 1; }
+        else { rc = cmd_exists(pos[0], pos[1], pos[2], &opts); }
+    } else if (strcmp(cmd, "count") == 0) {
+        if (npos != 2) { fprintf(stderr, "shibadb: count <file> <ns>\n"); rc = 1; }
+        else { rc = cmd_count(pos[0], pos[1], &opts); }
+    } else if (strcmp(cmd, "incr") == 0) {
+        if (npos != 3 && npos != 4) { fprintf(stderr, "shibadb: incr <file> <ns> <k> [delta]\n"); rc = 1; }
+        else {
+            int64_t delta = (npos == 4) ? (int64_t)strtoll(pos[3], NULL, 10) : 1;
+            rc = cmd_incr(pos[0], pos[1], pos[2], delta, &opts);
+        }
     } else if (strcmp(cmd, "backup") == 0) {
         if (npos != 2) { fprintf(stderr, "shibadb: backup <file> <dest>\n"); rc = 1; }
         else { rc = cmd_backup(pos[0], pos[1], &opts); }
