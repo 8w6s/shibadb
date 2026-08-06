@@ -6,6 +6,7 @@ sdb_database_backup
 sdb_database_close
 sdb_database_compact
 sdb_database_create
+sdb_database_info
 sdb_database_migrate
 sdb_database_open
 sdb_database_options_init

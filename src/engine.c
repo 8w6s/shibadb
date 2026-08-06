@@ -4676,6 +4676,35 @@ sdb_status sdb_database_verify(
     return status;
 }
 
+sdb_status sdb_database_info(
+    sdb_database *database, sdb_info_result *result_out
+)
+{
+    const sdb_superblock_v1 *superblock;
+    SDB_ENGINE_LOCK_OR_RETURN(database);
+    if (result_out == NULL) {
+        sdb_mutex_unlock(&database->mutex);
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    /*
+     * O(1): the pager keeps the authoritative superblock in memory, so a
+     * config/health probe needs no tree walk and no disk read. Copy under the
+     * handle lock so it cannot tear against an in-flight commit that rotates
+     * the superblock.
+     */
+    superblock = &database->pager.superblock;
+    (void)memset(result_out, 0, sizeof(*result_out));
+    result_out->struct_size = (uint32_t)sizeof(*result_out);
+    result_out->page_size = superblock->page_size;
+    result_out->encrypted = (superblock->flags & SDB_FLAG_ENCRYPTED) != 0U;
+    result_out->kdf_iterations = superblock->kdf_iterations;
+    result_out->generation = superblock->generation;
+    result_out->checkpoint_lsn = superblock->checkpoint_lsn;
+    result_out->page_count = superblock->next_page_id;
+    sdb_mutex_unlock(&database->mutex);
+    return SDB_OK;
+}
+
 sdb_status sdb_database_backup(
     sdb_database *database,
     const char *destination_path,

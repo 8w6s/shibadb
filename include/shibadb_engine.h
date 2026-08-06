@@ -115,6 +115,33 @@ typedef struct sdb_compact_result {
     uint64_t reserved[4];
 } sdb_compact_result;
 
+/**
+ * struct sdb_info_result - O(1) configuration snapshot of an open database.
+ * @struct_size:         sizeof(sdb_info_result); lets the struct grow compatibly.
+ * @page_size:           Page size in bytes.
+ * @encrypted:           True when the database uses authenticated encryption.
+ * @reserved_alignment:  Padding; always zero.
+ * @kdf_iterations:      PBKDF2 work factor (0 when @encrypted is false).
+ * @generation:          Monotonic superblock generation (bumped every commit).
+ * @checkpoint_lsn:      Log-sequence number of the most recent checkpoint.
+ * @page_count:          Highest page id ever allocated (file high-water mark).
+ * @reserved:            Reserved for future fields; always zero.
+ *
+ * Unlike sdb_verify_result, this is read straight from the in-memory
+ * superblock: it costs O(1), never walks the tree, and never touches disk.
+ */
+typedef struct sdb_info_result {
+    uint32_t struct_size;
+    uint32_t page_size;
+    bool encrypted;
+    uint8_t reserved_alignment[3];
+    uint32_t kdf_iterations;
+    uint64_t generation;
+    uint64_t checkpoint_lsn;
+    uint64_t page_count;
+    uint64_t reserved[4];
+} sdb_info_result;
+
 typedef bool (*sdb_index_visit_fn)(
     void *context, const uint8_t *document_id, size_t document_id_size
 );
@@ -143,6 +170,22 @@ SDB_API sdb_status sdb_database_close(sdb_database *database);
 
 SDB_API sdb_status sdb_database_verify(
     sdb_database *database, sdb_verify_result *result_out
+);
+
+/**
+ * sdb_database_info() - Read an open database's configuration snapshot.
+ * @database:   An open database handle.
+ * @result_out: Filled with the snapshot on success.
+ *
+ * O(1) health / configuration probe: takes the handle lock, copies fields from
+ * the in-memory superblock, and returns. It does not scan the tree — use
+ * sdb_database_verify() for deep structural counters.
+ *
+ * Return: SDB_OK on success; SDB_E_INVALID_ARGUMENT if @database is NULL or not
+ * open, or if @result_out is NULL.
+ */
+SDB_API sdb_status sdb_database_info(
+    sdb_database *database, sdb_info_result *result_out
 );
 
 SDB_API sdb_status sdb_database_backup(

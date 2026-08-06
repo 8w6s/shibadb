@@ -36,6 +36,7 @@ _Static_assert(
 _Static_assert(sizeof(sdb_verify_result) == 104U, "verify ABI changed");
 _Static_assert(sizeof(sdb_backup_result) == 40U, "backup ABI changed");
 _Static_assert(sizeof(sdb_compact_result) == 64U, "compact ABI changed");
+_Static_assert(sizeof(sdb_info_result) == 72U, "info result ABI changed");
 _Static_assert(
     offsetof(sdb_database_options, struct_size) == 0U,
     "options prefix changed"
