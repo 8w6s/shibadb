@@ -1,4 +1,4 @@
-﻿# Production-readiness roadmap
+# Production-readiness roadmap
 
 Progress is earned only when the capability exists **and** its reliability
 gate passes. Lines of code and partially implemented features do not count.
@@ -46,7 +46,7 @@ Linux GCC/Clang, macOS Clang, and Windows MSVC exists and is set up in
 `.github/workflows/ci.yml`; the release-candidate workflow emits
 commit-bound evidence with signed provenance for each platform. The
 remaining 2% is awarded when the native macOS and Windows runs actually
-land â€” i.e. once the repository is public and the first `v1.0.0-rc*`
+land — i.e. once the repository is public and the first `v1.0.0-rc*`
 tag triggers all three OS jobs successfully.
 
 Not yet fully production-ready: **the native macOS and Windows release
