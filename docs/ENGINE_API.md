@@ -125,6 +125,32 @@ source is cloned and left byte-for-byte untouched); it transforms object/chunk
 keys and copies index and sequence rows verbatim. It does not reclaim stale
 index rows — run `sdb_database_compact` on the destination if needed.
 
+## Convenience API (engine API version 2)
+
+Additive ergonomic helpers that compose the primitives above — they change no
+on-disk format and never touch the pager/WAL/B+Tree directly:
+
+- **Reads.** `sdb_kv_get_alloc` returns the value in a freshly allocated buffer
+  (free it with `sdb_free`), removing the probe-size-then-read dance;
+  `sdb_kv_exists` tests presence without copying.
+- **Counting.** `sdb_kv_count` / `sdb_kv_count_prefix` report namespace or
+  prefix cardinality over a read snapshot.
+- **Atomic single-key updates.** `sdb_kv_put_if_absent` (create-only, else
+  `SDB_E_CONFLICT`), `sdb_kv_compare_and_swap` (swap iff the current value
+  equals `expected`), and `sdb_kv_increment` (an 8-byte little-endian counter;
+  a missing key starts at 0, overflow returns `SDB_E_OVERFLOW`). Each runs in a
+  single transaction.
+- **Atomic batches.** `sdb_kv_batch_apply` applies an array of put/delete
+  operations in one all-or-nothing transaction, subject to the per-transaction
+  caps.
+- **Document queries.** `sdb_index_query_documents` is the `find({field:
+  value})` primitive: it resolves an exact secondary-index value to the matching
+  document bodies (not just ids), collecting ids under the visit lock and then
+  reading each body, skipping any deleted in between.
+
+The native `shibadb` CLI surfaces several of these directly: `exists`, `count`
+(with `--prefix`), and `incr`.
+
 ## Current limitations
 
 - no parallel reader throughput or shared read-only process handles;

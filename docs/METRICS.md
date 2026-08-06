@@ -156,7 +156,7 @@ First native-Windows gate run. Toolchain: MSVC 14.51 (`cl` 19.51) + Ninja,
 |---|---|
 | Build `/W4 /WX`, no suppressions | Clean. Every C4701 (false positives from MSVC's inter-procedural flow analysis not modelling the `status == SDB_OK ⇒ out-param written` contract) and C4996 (`sscanf` in two tests) was fixed at source, so `/wd4701` and `_CRT_SECURE_NO_WARNINGS` were removed from the build entirely |
 | `ctest` (57 tests) | 57/57 pass |
-| Engine soak (`test_engine_soak`, `SDB_SOAK_OPERATIONS=50000`) | exit 0 in ~10.5 min; mixed put/delete/get with periodic verify, backup+reopen, and compact; 0 assertion failures |
+| Engine soak (`test_engine_soak`) | 50,000 ops in ~10.5 min and a follow-up 200,000-op run both exit 0; mixed put/delete/get with periodic verify, backup+reopen, and compact; 0 assertion failures |
 | Path robustness fix | `sdb_database_open` now accepts forward-slash paths (was `SDB_E_IO` because the `\\?\` extended-length prefix disables Win32 `/`→`\` normalization); create/open/lock are now consistent. See `docs/WINDOWS.md` |
 
 AddressSanitizer (MSVC `/fsanitize=address`, `RelWithDebInfo`): built the full
