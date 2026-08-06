@@ -53,14 +53,19 @@ static sdb_status sdb_random_bytes_getrandom(uint8_t *output, size_t size)
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) \
     || defined(__OpenBSD__) || defined(__DragonFly__)
 /*
- * getentropy() is declared in <sys/random.h> on macOS and FreeBSD. Under the
- * strict feature macros this target sets (_POSIX_C_SOURCE / _XOPEN_SOURCE),
- * <unistd.h> alone does not expose it there, so the -Werror build fails with an
- * implicit-declaration error. The other BSDs declare getentropy() in
- * <unistd.h> (already included above) and lack <sys/random.h>.
+ * getentropy() is a non-POSIX extension. The strict feature macros this target
+ * sets (_POSIX_C_SOURCE / _XOPEN_SOURCE) hide it from <unistd.h> on every BSD
+ * and macOS, so a -Werror build fails with an implicit-declaration error.
+ * macOS and FreeBSD also declare it in <sys/random.h>; the remaining BSDs
+ * (NetBSD, OpenBSD, DragonFly) gate the <unistd.h> declaration behind a
+ * BSD-visibility macro that is off here and do not ship <sys/random.h>, so
+ * declare the prototype explicitly there. The symbol is always provided by
+ * libc; only its declaration is hidden.
  */
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/random.h>
+#else
+extern int getentropy(void *buffer, size_t length);
 #endif
 static sdb_status sdb_random_bytes_getentropy(uint8_t *output, size_t size)
 {

@@ -99,6 +99,26 @@ through `sdb_windows_path_from_utf8`.
   released, the file is not deleted); this is benign — a stale zero-byte
   `.lock` is not a held lock. Do not treat a lingering `.lock` as corruption.
 
+* **Identity lock namespace.** In addition to the `.lock` byte-range lock,
+  open takes a named kernel object keyed by the file's volume-serial + file
+  index (anti-aliasing: two path spellings of the same physical file collide).
+  It is created in the `Global\` namespace when possible and falls back to
+  `Local\` when the process lacks `SeCreateGlobalPrivilege` (ordinary
+  non-elevated apps), so a standard user can always open a database; the
+  `.lock` byte-range lock still enforces path-based, machine-wide exclusion.
+
+* **Known limitation (identity lock crash-release).** The identity object is a
+  named *semaphore*, chosen because it can be released from a different thread
+  than the one that acquired it (a named *mutex* is thread-affine, which would
+  break open-on-one-thread / close-on-another). A semaphore does not go
+  "abandoned" on owner death the way a mutex does, so in a narrow race a
+  crashed holder's identity slot can stay taken until every transient handle to
+  the object closes. The `.lock` byte-range lock (which the OS releases on
+  process death) is the primary crash-release mechanism; the identity object is
+  a secondary anti-aliasing guard. A fully crash-release-correct,
+  cross-thread, no-privilege identity lock needs a dedicated redesign
+  (e.g. an identity-named lock *file*) and multi-process/multi-thread tests.
+
 ## 5. Sanitizers and fuzzing on Windows
 
 * **AddressSanitizer** is available through MSVC (`/fsanitize=address`); the

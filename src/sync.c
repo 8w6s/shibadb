@@ -209,6 +209,29 @@ sdb_status sdb_process_lock_acquire_database(
         NULL, 1L, 1L, semaphore_name
     );
     if (identity_semaphore == NULL) {
+        /*
+         * The "Global\" namespace needs SeCreateGlobalPrivilege, which
+         * ordinary (non-elevated, non-service) processes do not have, so
+         * CreateSemaphoreW fails with ERROR_ACCESS_DENIED and the database
+         * cannot be opened at all. Fall back to the per-session "Local\"
+         * namespace so standard-user apps work; the .lock byte-range lock
+         * still enforces path-based, machine-wide exclusion, and privileged
+         * processes keep the cross-session "Global\" identity lock.
+         */
+        wchar_t local_name[96];
+        if (swprintf(
+                local_name,
+                sizeof(local_name) / sizeof(local_name[0]),
+                L"Local\\ShibaDB-%08lX-%08lX%08lX",
+                (unsigned long)information.dwVolumeSerialNumber,
+                (unsigned long)information.nFileIndexHigh,
+                (unsigned long)information.nFileIndexLow
+            ) < 0) {
+            return SDB_E_INTERNAL;
+        }
+        identity_semaphore = CreateSemaphoreW(NULL, 1L, 1L, local_name);
+    }
+    if (identity_semaphore == NULL) {
         return SDB_E_IO;
     }
     wait_status = WaitForSingleObject(identity_semaphore, 0U);
