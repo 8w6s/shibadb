@@ -136,6 +136,19 @@ expect_contains("${out}" "verify: OK" "encrypted verify")
 run(0 out health "${ENC}" --password "${PW}")
 expect_contains("${out}" "encrypted:      yes" "health encrypted")
 
+# --- document store: mkindex / docput (+index) / find / docget / docdel ---
+run(0 out mkindex "${DB}" people by_role)
+run(0 out docput "${DB}" people u1 "{\"n\":1}" --index by_role=admin)
+run(0 out docput "${DB}" people u2 "{\"n\":2}" --index by_role=admin)
+run(0 out docput "${DB}" people u3 "{\"n\":3}" --index by_role=user)
+run(0 out docget "${DB}" people u1)
+expect_contains("${out}" "{\"n\":1}" "docget body")
+run(0 out find "${DB}" people by_role admin)
+expect_contains("${out}" "u1" "find match u1")
+expect_contains("${out}" "u2" "find match u2")
+run(0 out docdel "${DB}" people u1)
+run(2 out docget "${DB}" people u1)   # deleted -> not found (exit 2)
+
 # --- misuse: non-zero, not a crash ---
 run(1 out get "${DB}")
 run(1 out bogus-command)

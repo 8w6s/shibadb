@@ -35,6 +35,9 @@ typedef struct cli_options {
     const char *prefix;     /* scan prefix, NULL = whole namespace */
     uint64_t limit;         /* 0 = unlimited */
     bool force;             /* backup: replace existing destination */
+    bool unique;            /* mkindex: create a unique index */
+    const char *index_specs[16]; /* docput: repeated --index name=value */
+    size_t index_count;
 } cli_options;
 
 static void cli_options_init(cli_options *opts) {
@@ -44,6 +47,8 @@ static void cli_options_init(cli_options *opts) {
     opts->prefix = NULL;
     opts->limit = 0U;
     opts->force = false;
+    opts->unique = false;
+    opts->index_count = 0U;
 }
 
 /*
@@ -89,6 +94,18 @@ static int cli_parse_options(int argc, char **argv, cli_options *opts,
             opts->limit = (uint64_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(arg, "--force") == 0 || strcmp(arg, "-f") == 0) {
             opts->force = true;
+        } else if (strcmp(arg, "--unique") == 0) {
+            opts->unique = true;
+        } else if (strcmp(arg, "--index") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "shibadb: --index requires name=value\n");
+                return -1;
+            }
+            if (opts->index_count >= 16U) {
+                fprintf(stderr, "shibadb: too many --index terms (max 16)\n");
+                return -1;
+            }
+            opts->index_specs[opts->index_count++] = argv[++i];
         } else if (strncmp(arg, "--", 2) == 0 && arg[2] != '\0') {
             fprintf(stderr, "shibadb: unknown option '%s'\n", arg);
             return -1;
@@ -508,6 +525,161 @@ static int cmd_incr(const char *path, const char *ns, const char *key,
     return 0;
 }
 
+static int cmd_mkindex(const char *path, const char *collection,
+                       const char *index, const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    st = sdb_index_create(db, (const uint8_t *)collection, strlen(collection),
+                          (const uint8_t *)index, strlen(index), opts->unique);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("mkindex", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("mkindex (close)", close_st);
+    }
+    printf("index '%s' created on '%s'%s\n", index, collection,
+           opts->unique ? " (unique)" : "");
+    return 0;
+}
+
+static int cmd_docput(const char *path, const char *collection, const char *id,
+                      const char *json, const cli_options *opts) {
+    sdb_index_term terms[16];
+    size_t i;
+    sdb_database *db = NULL;
+    sdb_status st;
+    sdb_status close_st;
+    for (i = 0; i < opts->index_count; ++i) {
+        const char *spec = opts->index_specs[i];
+        const char *eq = strchr(spec, '=');
+        if (eq == NULL) {
+            fprintf(stderr, "shibadb: --index expects name=value, got '%s'\n",
+                    spec);
+            return 1;
+        }
+        terms[i].index_name = (const uint8_t *)spec;
+        terms[i].index_name_size = (size_t)(eq - spec);
+        terms[i].value = (const uint8_t *)(eq + 1);
+        terms[i].value_size = strlen(eq + 1);
+    }
+    st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    st = sdb_document_put(db, (const uint8_t *)collection, strlen(collection),
+                          (const uint8_t *)id, strlen(id),
+                          (const uint8_t *)json, strlen(json),
+                          opts->index_count > 0U ? terms : NULL,
+                          opts->index_count);
+    close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("docput", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("docput (close)", close_st);
+    }
+    return 0;
+}
+
+static int cmd_docget(const char *path, const char *collection, const char *id,
+                      const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    size_t needed = 0;
+    st = sdb_document_get(db, (const uint8_t *)collection, strlen(collection),
+                          (const uint8_t *)id, strlen(id), NULL, 0, &needed);
+    if (st != SDB_OK && st != SDB_E_BUFFER_TOO_SMALL) {
+        (void)sdb_database_close(db);
+        return fail("docget", st);
+    }
+    uint8_t *buf = NULL;
+    if (needed > 0) {
+        buf = (uint8_t *)malloc(needed);
+        if (buf == NULL) {
+            (void)sdb_database_close(db);
+            fprintf(stderr, "shibadb: docget: out of memory\n");
+            return 2;
+        }
+    }
+    size_t got = 0;
+    st = sdb_document_get(db, (const uint8_t *)collection, strlen(collection),
+                          (const uint8_t *)id, strlen(id), buf, needed, &got);
+    if (st == SDB_OK && got > 0) {
+        fwrite(buf, 1, got, stdout);
+        fputc('\n', stdout);
+    }
+    free(buf);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("docget", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("docget (close)", close_st);
+    }
+    return 0;
+}
+
+static int cmd_docdel(const char *path, const char *collection, const char *id,
+                      const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    st = sdb_document_delete(db, (const uint8_t *)collection, strlen(collection),
+                             (const uint8_t *)id, strlen(id));
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("docdel", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("docdel (close)", close_st);
+    }
+    return 0;
+}
+
+static bool cli_find_visitor(void *context, const uint8_t *document_id,
+                             size_t document_id_size, const uint8_t *document,
+                             size_t document_size) {
+    (void)context;
+    fwrite(document_id, 1, document_id_size, stdout);
+    fputc('\t', stdout);
+    fwrite(document, 1, document_size, stdout);
+    fputc('\n', stdout);
+    return true;
+}
+
+static int cmd_find(const char *path, const char *collection, const char *index,
+                    const char *value, const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    size_t matched = 0;
+    st = sdb_index_query_documents(
+        db, (const uint8_t *)collection, strlen(collection),
+        (const uint8_t *)index, strlen(index),
+        (const uint8_t *)value, strlen(value),
+        cli_find_visitor, NULL, &matched);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("find", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("find (close)", close_st);
+    }
+    fprintf(stderr, "shibadb: %zu documents\n", matched);
+    return 0;
+}
+
 static int cmd_backup(const char *path, const char *dest,
                       const cli_options *opts) {
     sdb_database *db = NULL;
@@ -595,6 +767,13 @@ static int usage(FILE *out) {
 "  exists     <file> <ns> <k>      Print yes/no (exit 3 if the key is absent)\n"
 "  count      <file> <ns>          Count keys in a namespace (honours --prefix)\n"
 "  incr       <file> <ns> <k> [n]  Atomically add n (default 1) to a counter\n"
+"\n"
+"Documents:\n"
+"  mkindex    <file> <coll> <name>       Create a secondary index (--unique)\n"
+"  docput     <file> <coll> <id> <json>  Store a document (repeat --index n=v)\n"
+"  docget     <file> <coll> <id>         Print a document body\n"
+"  docdel     <file> <coll> <id>         Delete a document\n"
+"  find       <file> <coll> <idx> <val>  Print id<TAB>doc for index matches\n"
 "  backup     <file> <dest>        Atomic snapshot to a new file\n"
 "  compact    <file>               Reclaim stale space in place\n"
 "\n"
@@ -682,6 +861,21 @@ int main(int argc, char **argv) {
             int64_t delta = (npos == 4) ? (int64_t)strtoll(pos[3], NULL, 10) : 1;
             rc = cmd_incr(pos[0], pos[1], pos[2], delta, &opts);
         }
+    } else if (strcmp(cmd, "mkindex") == 0) {
+        if (npos != 3) { fprintf(stderr, "shibadb: mkindex <file> <coll> <name>\n"); rc = 1; }
+        else { rc = cmd_mkindex(pos[0], pos[1], pos[2], &opts); }
+    } else if (strcmp(cmd, "docput") == 0) {
+        if (npos != 4) { fprintf(stderr, "shibadb: docput <file> <coll> <id> <json>\n"); rc = 1; }
+        else { rc = cmd_docput(pos[0], pos[1], pos[2], pos[3], &opts); }
+    } else if (strcmp(cmd, "docget") == 0) {
+        if (npos != 3) { fprintf(stderr, "shibadb: docget <file> <coll> <id>\n"); rc = 1; }
+        else { rc = cmd_docget(pos[0], pos[1], pos[2], &opts); }
+    } else if (strcmp(cmd, "docdel") == 0) {
+        if (npos != 3) { fprintf(stderr, "shibadb: docdel <file> <coll> <id>\n"); rc = 1; }
+        else { rc = cmd_docdel(pos[0], pos[1], pos[2], &opts); }
+    } else if (strcmp(cmd, "find") == 0) {
+        if (npos != 4) { fprintf(stderr, "shibadb: find <file> <coll> <idx> <val>\n"); rc = 1; }
+        else { rc = cmd_find(pos[0], pos[1], pos[2], pos[3], &opts); }
     } else if (strcmp(cmd, "backup") == 0) {
         if (npos != 2) { fprintf(stderr, "shibadb: backup <file> <dest>\n"); rc = 1; }
         else { rc = cmd_backup(pos[0], pos[1], &opts); }
