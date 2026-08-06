@@ -104,6 +104,24 @@ sdb_status sdb_windows_path_from_utf8(
         free(wide_path);
         return SDB_E_INVALID_ARGUMENT;
     }
+    /*
+     * Normalize forward slashes to backslashes before the extended-length
+     * "\\?\" prefix is applied. Win32 treats '/' and '\' as equivalent
+     * separators for ordinary paths, but the "\\?\" prefix disables that
+     * normalization and makes '/' an invalid filename character. Callers that
+     * reach CreateFileW directly (sdb_database_open, the lock sidecar) would
+     * otherwise fail with SDB_E_IO on a '/'-style path, even though
+     * sdb_database_create — which launders the path through GetFullPathNameW —
+     * accepts it. Converting here makes create/open/lock consistent.
+     */
+    {
+        wchar_t *cursor;
+        for (cursor = wide_path; *cursor != L'\0'; ++cursor) {
+            if (*cursor == L'/') {
+                *cursor = L'\\';
+            }
+        }
+    }
     *wide_path_out = wide_path;
     return sdb_windows_path_add_extended_prefix(wide_path_out);
 }
