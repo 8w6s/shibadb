@@ -46,6 +46,13 @@ during writes).
   `compact`, explicit `migrate` (password rotation, page-size change).
 - **Stable C ABI**: `SDB_ABI_VERSION = 1`, semver-tagged, versioned headers,
   CMake `find_package(shibadb)` and pkg-config integration.
+- **Ergonomic convenience API**: allocating reads (`sdb_kv_get_alloc`),
+  `sdb_kv_exists` / `sdb_kv_count`, atomic `put_if_absent` /
+  `compare_and_swap` / `increment` counters, one-call atomic batches, and
+  `sdb_index_query_documents` (find-by-field returning document bodies). See
+  [examples/quickstart.c](examples/quickstart.c).
+- **Native CLI**: a dependency-free `shibadb` binary for KV/document access,
+  `find`, `verify`, `backup`, `compact`, and scripting.
 
 ## Platform matrix
 
@@ -92,7 +99,29 @@ int main(void) {
 
 All functions return an `sdb_status`; `SDB_OK` is success. Get operations
 report the required buffer size — pass `NULL`/`0` to size a value before
-allocating.
+allocating, or use `sdb_kv_get_alloc` to have the library allocate for you.
+A fuller tour of the ergonomic API is in
+[examples/quickstart.c](examples/quickstart.c).
+
+## Command-line tool
+
+The build produces a dependency-free `shibadb` executable for inspecting and
+scripting databases:
+
+```bash
+shibadb create  data.shiba
+shibadb put     data.shiba users alice '{"role":"admin"}'
+shibadb get     data.shiba users alice
+shibadb scan    data.shiba users --prefix a
+shibadb incr    data.shiba counters visits
+shibadb mkindex data.shiba people by_role
+shibadb docput  data.shiba people u1 '{"name":"alice"}' --index by_role=admin
+shibadb find    data.shiba people by_role admin
+shibadb verify  data.shiba
+```
+
+Run `shibadb help` for the full command list. Pass `--password` (or set the
+`SHIBADB_PASSWORD` environment variable) to work with encrypted databases.
 
 ## Quickstart
 
