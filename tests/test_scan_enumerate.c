@@ -429,9 +429,13 @@ static void test_cursor_reverse_multileaf(void)
         const uint8_t *kp;
         size_t ks;
         long id;
+        char id_text[8];
         assert(sdb_cursor_key(cur, &kp, &ks) == SDB_OK);
         assert(ks == 6U); /* "kNNNNN" */
-        id = atol((const char *)kp + 1);
+        /* cursor keys are raw bytes, not NUL-terminated: copy before parsing */
+        memcpy(id_text, kp + 1, ks - 1U);
+        id_text[ks - 1U] = '\0';
+        id = atol(id_text);
         assert(id == previous - 1); /* strictly descending, no gap */
         previous = id;
         ++count;
