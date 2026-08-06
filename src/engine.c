@@ -6720,3 +6720,371 @@ sdb_status sdb_list_namespaces(
 }
 
 #undef SDB_ENGINE_LOCK_OR_RETURN
+
+/*
+ * ============================================================================
+ * Convenience API (SDB_ENGINE_API_VERSION 2) — see shibadb_engine.h. Thin
+ * wrappers that compose the public KV, scan, and transaction entry points;
+ * they add no on-disk state and never touch the pager/WAL/B+Tree directly.
+ * ============================================================================
+ */
+
+void sdb_free(void *pointer)
+{
+    free(pointer);
+}
+
+sdb_status sdb_kv_get_alloc(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    uint8_t **value_out,
+    size_t *value_size_out
+)
+{
+    if (value_out == NULL || value_size_out == NULL) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    *value_out = NULL;
+    *value_size_out = 0U;
+    for (;;) {
+        size_t needed = 0U;
+        size_t capacity;
+        size_t written = 0U;
+        uint8_t *buffer;
+        sdb_status status = sdb_kv_get(
+            database, namespace_name, namespace_size, key, key_size,
+            NULL, 0U, &needed
+        );
+        if (status != SDB_OK && status != SDB_E_BUFFER_TOO_SMALL) {
+            return status; /* SDB_E_NOT_FOUND or a real error */
+        }
+        /* Allocate at least one byte so a zero-length value is non-NULL. */
+        capacity = needed == 0U ? 1U : needed;
+        buffer = (uint8_t *)malloc(capacity);
+        if (buffer == NULL) {
+            return SDB_E_OUT_OF_MEMORY;
+        }
+        status = sdb_kv_get(
+            database, namespace_name, namespace_size, key, key_size,
+            buffer, capacity, &written
+        );
+        if (status == SDB_E_BUFFER_TOO_SMALL) {
+            /* A concurrent writer grew the value; retry with the new size. */
+            free(buffer);
+            continue;
+        }
+        if (status != SDB_OK) {
+            free(buffer);
+            return status;
+        }
+        *value_out = buffer;
+        *value_size_out = written;
+        return SDB_OK;
+    }
+}
+
+sdb_status sdb_kv_exists(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    bool *exists_out
+)
+{
+    size_t needed = 0U;
+    sdb_status status;
+    if (exists_out == NULL) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    status = sdb_kv_get(
+        database, namespace_name, namespace_size, key, key_size,
+        NULL, 0U, &needed
+    );
+    if (status == SDB_OK || status == SDB_E_BUFFER_TOO_SMALL) {
+        *exists_out = true;
+        return SDB_OK;
+    }
+    if (status == SDB_E_NOT_FOUND) {
+        *exists_out = false;
+        return SDB_OK;
+    }
+    return status;
+}
+
+static bool sdb_convenience_count_visitor(
+    void *context,
+    const uint8_t *key,
+    size_t key_size,
+    const uint8_t *value,
+    size_t value_size
+)
+{
+    (void)key;
+    (void)key_size;
+    (void)value;
+    (void)value_size;
+    ++*(uint64_t *)context;
+    return true;
+}
+
+sdb_status sdb_kv_count_prefix(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *prefix,
+    size_t prefix_size,
+    uint64_t *count_out
+)
+{
+    uint64_t total = 0U;
+    sdb_status status;
+    if (count_out == NULL) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    status = sdb_kv_scan_prefix(
+        database, namespace_name, namespace_size, prefix, prefix_size,
+        NULL, sdb_convenience_count_visitor, &total, NULL
+    );
+    if (status == SDB_OK) {
+        *count_out = total;
+    }
+    return status;
+}
+
+sdb_status sdb_kv_count(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    uint64_t *count_out
+)
+{
+    return sdb_kv_count_prefix(
+        database, namespace_name, namespace_size, NULL, 0U, count_out
+    );
+}
+
+sdb_status sdb_kv_put_if_absent(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    const uint8_t *value,
+    size_t value_size
+)
+{
+    sdb_transaction *txn = NULL;
+    size_t needed = 0U;
+    sdb_status op;
+    sdb_status status = sdb_transaction_begin(database, &txn);
+    if (status != SDB_OK) {
+        return status;
+    }
+    op = sdb_transaction_kv_get(
+        txn, namespace_name, namespace_size, key, key_size, NULL, 0U, &needed
+    );
+    if (op == SDB_OK || op == SDB_E_BUFFER_TOO_SMALL) {
+        op = SDB_E_CONFLICT; /* key already present */
+    } else if (op == SDB_E_NOT_FOUND) {
+        op = sdb_transaction_kv_put(
+            txn, namespace_name, namespace_size, key, key_size,
+            value, value_size
+        );
+    }
+    if (op == SDB_OK) {
+        status = sdb_transaction_commit(txn);
+    } else {
+        (void)sdb_transaction_rollback(txn);
+        status = op;
+    }
+    (void)sdb_transaction_close(txn);
+    return status;
+}
+
+sdb_status sdb_kv_compare_and_swap(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    const uint8_t *expected,
+    size_t expected_size,
+    const uint8_t *desired,
+    size_t desired_size
+)
+{
+    sdb_transaction *txn = NULL;
+    uint8_t *current = NULL;
+    size_t current_size = 0U;
+    size_t needed = 0U;
+    sdb_status op;
+    sdb_status status = sdb_transaction_begin(database, &txn);
+    if (status != SDB_OK) {
+        return status;
+    }
+    op = sdb_transaction_kv_get(
+        txn, namespace_name, namespace_size, key, key_size, NULL, 0U, &needed
+    );
+    if (op == SDB_E_NOT_FOUND) {
+        op = SDB_E_CONFLICT; /* nothing to compare against */
+    } else if (op == SDB_OK || op == SDB_E_BUFFER_TOO_SMALL) {
+        size_t capacity = needed == 0U ? 1U : needed;
+        current = (uint8_t *)malloc(capacity);
+        if (current == NULL) {
+            op = SDB_E_OUT_OF_MEMORY;
+        } else {
+            op = sdb_transaction_kv_get(
+                txn, namespace_name, namespace_size, key, key_size,
+                current, capacity, &current_size
+            );
+            if (op == SDB_OK) {
+                bool match = current_size == expected_size
+                    && (expected_size == 0U
+                        || memcmp(current, expected, expected_size) == 0);
+                if (match) {
+                    op = sdb_transaction_kv_put(
+                        txn, namespace_name, namespace_size, key, key_size,
+                        desired, desired_size
+                    );
+                } else {
+                    op = SDB_E_CONFLICT;
+                }
+            }
+        }
+    }
+    free(current);
+    if (op == SDB_OK) {
+        status = sdb_transaction_commit(txn);
+    } else {
+        (void)sdb_transaction_rollback(txn);
+        status = op;
+    }
+    (void)sdb_transaction_close(txn);
+    return status;
+}
+
+sdb_status sdb_kv_increment(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    int64_t delta,
+    int64_t *new_value_out
+)
+{
+    sdb_transaction *txn = NULL;
+    uint8_t buffer[8];
+    size_t got = 0U;
+    int64_t current = 0;
+    int64_t result = 0;
+    sdb_status op;
+    sdb_status status = sdb_transaction_begin(database, &txn);
+    if (status != SDB_OK) {
+        return status;
+    }
+    op = sdb_transaction_kv_get(
+        txn, namespace_name, namespace_size, key, key_size,
+        buffer, sizeof(buffer), &got
+    );
+    if (op == SDB_OK) {
+        if (got != 8U) {
+            op = SDB_E_INVALID_ARGUMENT; /* not an 8-byte counter */
+        } else {
+            uint64_t raw = 0U;
+            int index;
+            for (index = 0; index < 8; ++index) {
+                raw |= (uint64_t)buffer[index] << (8 * index);
+            }
+            current = (int64_t)raw;
+        }
+    } else if (op == SDB_E_NOT_FOUND) {
+        current = 0;
+        op = SDB_OK; /* absent counter starts at zero */
+    } else if (op == SDB_E_BUFFER_TOO_SMALL) {
+        op = SDB_E_INVALID_ARGUMENT; /* value larger than 8 bytes */
+    }
+    if (op == SDB_OK) {
+        if ((delta > 0 && current > INT64_MAX - delta)
+            || (delta < 0 && current < INT64_MIN - delta)) {
+            op = SDB_E_OVERFLOW;
+        } else {
+            uint64_t raw;
+            int index;
+            result = current + delta;
+            raw = (uint64_t)result;
+            for (index = 0; index < 8; ++index) {
+                buffer[index] = (uint8_t)((raw >> (8 * index)) & 0xFFU);
+            }
+            op = sdb_transaction_kv_put(
+                txn, namespace_name, namespace_size, key, key_size,
+                buffer, 8U
+            );
+        }
+    }
+    if (op == SDB_OK) {
+        status = sdb_transaction_commit(txn);
+        if (status == SDB_OK && new_value_out != NULL) {
+            *new_value_out = result;
+        }
+    } else {
+        (void)sdb_transaction_rollback(txn);
+        status = op;
+    }
+    (void)sdb_transaction_close(txn);
+    return status;
+}
+
+sdb_status sdb_kv_batch_apply(
+    sdb_database *database,
+    const sdb_batch_op *ops,
+    size_t op_count
+)
+{
+    sdb_transaction *txn = NULL;
+    sdb_status status;
+    sdb_status op = SDB_OK;
+    size_t index;
+    if (op_count == 0U) {
+        return SDB_OK;
+    }
+    if (ops == NULL) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    status = sdb_transaction_begin(database, &txn);
+    if (status != SDB_OK) {
+        return status;
+    }
+    for (index = 0U; index < op_count && op == SDB_OK; ++index) {
+        const sdb_batch_op *entry = &ops[index];
+        switch (entry->kind) {
+        case SDB_BATCH_OP_KV_PUT:
+            op = sdb_transaction_kv_put(
+                txn, entry->namespace_name, entry->namespace_size,
+                entry->key, entry->key_size, entry->value, entry->value_size
+            );
+            break;
+        case SDB_BATCH_OP_KV_DELETE:
+            op = sdb_transaction_kv_delete(
+                txn, entry->namespace_name, entry->namespace_size,
+                entry->key, entry->key_size
+            );
+            break;
+        default:
+            op = SDB_E_INVALID_ARGUMENT;
+            break;
+        }
+    }
+    if (op == SDB_OK) {
+        status = sdb_transaction_commit(txn);
+    } else {
+        (void)sdb_transaction_rollback(txn);
+        status = op;
+    }
+    (void)sdb_transaction_close(txn);
+    return status;
+}

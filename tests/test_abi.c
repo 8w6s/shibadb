@@ -14,6 +14,7 @@ _Static_assert(
 );
 _Static_assert(sizeof(sdb_database_options) == 64U, "options ABI changed");
 _Static_assert(sizeof(sdb_index_term) == 32U, "index term ABI changed");
+_Static_assert(sizeof(sdb_batch_op) == 56U, "batch op ABI changed");
 _Static_assert(
     offsetof(sdb_database_options, password) == 16U,
     "options password offset changed"
@@ -25,6 +26,7 @@ _Static_assert(
 );
 _Static_assert(sizeof(sdb_database_options) == 52U, "options ABI changed");
 _Static_assert(sizeof(sdb_index_term) == 16U, "index term ABI changed");
+_Static_assert(sizeof(sdb_batch_op) == 32U, "batch op ABI changed");
 _Static_assert(
     offsetof(sdb_database_options, password) == 12U,
     "options password offset changed"

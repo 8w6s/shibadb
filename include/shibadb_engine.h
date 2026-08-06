@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define SDB_ENGINE_API_VERSION UINT32_C(1)
+#define SDB_ENGINE_API_VERSION UINT32_C(2)
 
 #define SDB_ENGINE_API_EXPERIMENTAL SDB_ENGINE_API_VERSION
 
@@ -696,6 +696,196 @@ SDB_API sdb_status sdb_list_namespaces(
     sdb_namespace_visit_fn visitor,
     void *context,
     size_t *count_out
+);
+
+/*
+ * ============================================================================
+ * Convenience API (SDB_ENGINE_API_VERSION 2). Additive, ergonomic wrappers
+ * over the primitives above: allocating reads, existence and count, atomic
+ * put-if-absent / compare-and-swap / increment, one-call atomic batches. None
+ * of these change the on-disk format or touch the audited pager/WAL/B+Tree —
+ * they compose the public KV, scan, and transaction entry points.
+ * ============================================================================
+ */
+
+/**
+ * sdb_free() - Release a buffer returned by an allocating shibadb call.
+ * @pointer: A buffer handed back by sdb_kv_get_alloc(), or NULL.
+ *
+ * Frees with the same allocator shibadb allocated it from. This matters when
+ * the application and the library link different C runtimes (e.g. a Windows
+ * DLL): freeing a library allocation with the app's free() is undefined.
+ * NULL is a no-op.
+ */
+SDB_API void sdb_free(void *pointer);
+
+/**
+ * sdb_kv_get_alloc() - Fetch a KV value into a newly allocated buffer.
+ * @database:        An open database handle.
+ * @namespace_name:  KV namespace.
+ * @namespace_size:  Length of @namespace_name in bytes.
+ * @key:             Key to look up.
+ * @key_size:        Length of @key in bytes.
+ * @value_out:       Receives a malloc'd buffer with the value; free with
+ *                   sdb_free(). Set to NULL and size 0 on any non-OK return.
+ * @value_size_out:  Receives the value length.
+ *
+ * Removes the two-call "probe the size, then read" dance of sdb_kv_get(). A
+ * zero-length value yields a valid non-NULL 1-byte buffer with size 0.
+ *
+ * Return: SDB_OK; SDB_E_NOT_FOUND; SDB_E_OUT_OF_MEMORY; SDB_E_INVALID_ARGUMENT.
+ */
+SDB_API sdb_status sdb_kv_get_alloc(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    uint8_t **value_out,
+    size_t *value_size_out
+);
+
+/**
+ * sdb_kv_exists() - Test whether a KV key is present without copying its value.
+ * @exists_out: Receives true iff the key exists.
+ *
+ * Return: SDB_OK (regardless of presence); SDB_E_INVALID_ARGUMENT.
+ */
+SDB_API sdb_status sdb_kv_exists(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    bool *exists_out
+);
+
+/**
+ * sdb_kv_count() - Count all keys in a KV namespace.
+ * @count_out: Receives the number of keys.
+ *
+ * Walks a read snapshot of the namespace. Return: SDB_OK; SDB_E_INVALID_ARGUMENT.
+ */
+SDB_API sdb_status sdb_kv_count(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    uint64_t *count_out
+);
+
+/**
+ * sdb_kv_count_prefix() - Count keys in a namespace beginning with a prefix.
+ * @prefix:      Prefix to match; may be NULL iff @prefix_size is 0 (count all).
+ * @count_out:   Receives the number of matching keys.
+ */
+SDB_API sdb_status sdb_kv_count_prefix(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *prefix,
+    size_t prefix_size,
+    uint64_t *count_out
+);
+
+/**
+ * sdb_kv_put_if_absent() - Store a value only if the key does not yet exist.
+ *
+ * Atomic (single transaction). Return: SDB_OK on write; SDB_E_CONFLICT if the
+ * key already exists (nothing written).
+ */
+SDB_API sdb_status sdb_kv_put_if_absent(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    const uint8_t *value,
+    size_t value_size
+);
+
+/**
+ * sdb_kv_compare_and_swap() - Replace a value only if it equals @expected.
+ * @expected:      Bytes the current value must equal for the swap to happen.
+ * @desired:       Bytes to store when the comparison succeeds.
+ *
+ * Atomic (single transaction). Return: SDB_OK on swap; SDB_E_CONFLICT if the
+ * key is absent or the current value differs (nothing written).
+ */
+SDB_API sdb_status sdb_kv_compare_and_swap(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    const uint8_t *expected,
+    size_t expected_size,
+    const uint8_t *desired,
+    size_t desired_size
+);
+
+/**
+ * sdb_kv_increment() - Atomically add @delta to an 8-byte little-endian counter.
+ * @delta:          Signed amount to add.
+ * @new_value_out:  Receives the counter value after the add (optional, may be
+ *                  NULL).
+ *
+ * A missing key is treated as 0 and created. Atomic (single transaction).
+ * Return: SDB_OK; SDB_E_INVALID_ARGUMENT if the existing value is not exactly
+ * 8 bytes; SDB_E_OVERFLOW if the signed addition would wrap.
+ */
+SDB_API sdb_status sdb_kv_increment(
+    sdb_database *database,
+    const uint8_t *namespace_name,
+    size_t namespace_size,
+    const uint8_t *key,
+    size_t key_size,
+    int64_t delta,
+    int64_t *new_value_out
+);
+
+/* Operation kind for sdb_batch_op. */
+typedef enum sdb_batch_op_kind {
+    SDB_BATCH_OP_KV_PUT = 1,
+    SDB_BATCH_OP_KV_DELETE = 2
+} sdb_batch_op_kind;
+
+/**
+ * struct sdb_batch_op - One operation in an sdb_kv_batch_apply() batch.
+ * @kind:            An sdb_batch_op_kind value.
+ * @reserved_alignment: Padding; set to 0.
+ * @namespace_name:  KV namespace.
+ * @namespace_size:  Length of @namespace_name.
+ * @key:             Key to write or delete.
+ * @key_size:        Length of @key.
+ * @value:           Value bytes (ignored, may be NULL, for a delete).
+ * @value_size:      Length of @value.
+ */
+typedef struct sdb_batch_op {
+    uint32_t kind;
+    uint32_t reserved_alignment;
+    const uint8_t *namespace_name;
+    size_t namespace_size;
+    const uint8_t *key;
+    size_t key_size;
+    const uint8_t *value;
+    size_t value_size;
+} sdb_batch_op;
+
+/**
+ * sdb_kv_batch_apply() - Apply many KV puts/deletes in one atomic transaction.
+ * @ops:       Array of operations, applied in order.
+ * @op_count:  Number of operations.
+ *
+ * All-or-nothing: if any operation fails the whole batch is rolled back and the
+ * failing status is returned. Subject to the per-transaction caps
+ * (SDB_TRANSACTION_MAX_OPERATIONS, SDB_TRANSACTION_MAX_LOGICAL_BYTES), which
+ * report SDB_E_OVERFLOW. An empty batch (op_count 0) is a no-op returning
+ * SDB_OK.
+ */
+SDB_API sdb_status sdb_kv_batch_apply(
+    sdb_database *database,
+    const sdb_batch_op *ops,
+    size_t op_count
 );
 
 #ifdef __cplusplus
