@@ -755,6 +755,18 @@ if(SDB_BUILD_TESTS)
         LABELS packaging
         RUN_SERIAL TRUE
     )
+
+    # Drive the native CLI end to end (argument parsing, exit codes, KV round
+    # trip, encryption, backup/compact) the way a shell script would.
+    if(SDB_BUILD_CLI)
+        add_test(
+            NAME cli
+            COMMAND ${CMAKE_COMMAND}
+                -DCLI=$<TARGET_FILE:shibadb_cli>
+                -DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}/_cli_work
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.cmake
+        )
+    endif()
 endif()
 
 if(SDB_ENABLE_SOAK_TESTS)
