@@ -888,6 +888,52 @@ SDB_API sdb_status sdb_kv_batch_apply(
     size_t op_count
 );
 
+/*
+ * Visitor for sdb_index_query_documents(). Receives both the matching
+ * document id and its full body (both borrowed for the call only). Return true
+ * to continue, false to stop early.
+ */
+typedef bool (*sdb_document_visit_fn)(
+    void *context,
+    const uint8_t *document_id,
+    size_t document_id_size,
+    const uint8_t *document,
+    size_t document_size
+);
+
+/**
+ * sdb_index_query_documents() - Find documents by an exact secondary-index value.
+ * @database:         An open database handle.
+ * @collection:       Document collection.
+ * @collection_size:  Length of @collection.
+ * @index_name:       Secondary index to look up (created with sdb_index_create).
+ * @index_name_size:  Length of @index_name.
+ * @value:            Index value to match exactly.
+ * @value_size:       Length of @value.
+ * @visitor:          Called once per matching document with its id and body.
+ * @context:          Opaque pointer passed to @visitor.
+ * @match_count_out:  Optional; receives the number of documents visited.
+ *
+ * This is the "find({field: value})" primitive: sdb_index_visit() only yields
+ * document ids, so callers otherwise fetch each body themselves. It collects
+ * the matching ids, then reads each body — a document deleted between the two
+ * steps is silently skipped (best-effort, not a single atomic snapshot).
+ *
+ * Return: SDB_OK; SDB_E_OUT_OF_MEMORY; SDB_E_INVALID_ARGUMENT; or a read error.
+ */
+SDB_API sdb_status sdb_index_query_documents(
+    sdb_database *database,
+    const uint8_t *collection,
+    size_t collection_size,
+    const uint8_t *index_name,
+    size_t index_name_size,
+    const uint8_t *value,
+    size_t value_size,
+    sdb_document_visit_fn visitor,
+    void *context,
+    size_t *match_count_out
+);
+
 #ifdef __cplusplus
 }
 #endif

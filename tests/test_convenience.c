@@ -42,6 +42,28 @@ static void put_i64(sdb_database *db, const char *key, int64_t value)
                       buffer, sizeof(buffer)) == SDB_OK);
 }
 
+typedef struct query_ctx {
+    int count;
+    size_t total_body;
+} query_ctx;
+
+static bool query_visitor(
+    void *context,
+    const uint8_t *document_id,
+    size_t document_id_size,
+    const uint8_t *document,
+    size_t document_size
+)
+{
+    query_ctx *q = (query_ctx *)context;
+    (void)document_id;
+    (void)document_id_size;
+    (void)document;
+    q->count++;
+    q->total_body += document_size;
+    return true;
+}
+
 int main(void)
 {
     const char *path = "test_convenience.shiba";
@@ -177,6 +199,51 @@ int main(void)
         assert(sdb_kv_batch_apply(db, bad, 2U) == SDB_E_INVALID_ARGUMENT);
         assert(sdb_kv_exists(db, NS, NS_SIZE, (const uint8_t *)"rollback", 8U,
                              &exists) == SDB_OK && !exists);
+    }
+
+    /* --- index_query_documents (find-by-field returning bodies) --- */
+    {
+        const uint8_t coll[] = "people";
+        const uint8_t idx[] = "by_role";
+        sdb_index_term term;
+        query_ctx qc;
+        size_t matched = 0U;
+        assert(sdb_index_create(db, coll, sizeof(coll) - 1U,
+                                idx, sizeof(idx) - 1U, false) == SDB_OK);
+        term.index_name = idx;
+        term.index_name_size = sizeof(idx) - 1U;
+        term.value = (const uint8_t *)"admin";
+        term.value_size = 5U;
+        assert(sdb_document_put(db, coll, sizeof(coll) - 1U,
+                                (const uint8_t *)"u1", 2U,
+                                (const uint8_t *)"{\"n\":1}", 7U,
+                                &term, 1U) == SDB_OK);
+        assert(sdb_document_put(db, coll, sizeof(coll) - 1U,
+                                (const uint8_t *)"u2", 2U,
+                                (const uint8_t *)"{\"n\":2}", 7U,
+                                &term, 1U) == SDB_OK);
+        term.value = (const uint8_t *)"user";
+        term.value_size = 4U;
+        assert(sdb_document_put(db, coll, sizeof(coll) - 1U,
+                                (const uint8_t *)"u3", 2U,
+                                (const uint8_t *)"{\"n\":3}", 7U,
+                                &term, 1U) == SDB_OK);
+
+        qc.count = 0;
+        qc.total_body = 0U;
+        assert(sdb_index_query_documents(
+                   db, coll, sizeof(coll) - 1U, idx, sizeof(idx) - 1U,
+                   (const uint8_t *)"admin", 5U, query_visitor, &qc, &matched)
+               == SDB_OK);
+        assert(matched == 2U && qc.count == 2 && qc.total_body == 14U);
+
+        qc.count = 0;
+        qc.total_body = 0U;
+        assert(sdb_index_query_documents(
+                   db, coll, sizeof(coll) - 1U, idx, sizeof(idx) - 1U,
+                   (const uint8_t *)"user", 4U, query_visitor, &qc, &matched)
+               == SDB_OK);
+        assert(matched == 1U && qc.count == 1);
     }
 
     assert(sdb_database_close(db) == SDB_OK);

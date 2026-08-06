@@ -7088,3 +7088,150 @@ sdb_status sdb_kv_batch_apply(
     (void)sdb_transaction_close(txn);
     return status;
 }
+
+typedef struct sdb_collected_id {
+    uint8_t *bytes;
+    size_t size;
+} sdb_collected_id;
+
+typedef struct sdb_index_id_collector {
+    sdb_collected_id *items;
+    size_t count;
+    size_t capacity;
+    bool out_of_memory;
+} sdb_index_id_collector;
+
+static bool sdb_index_collect_visitor(
+    void *context, const uint8_t *document_id, size_t document_id_size
+)
+{
+    sdb_index_id_collector *collector = (sdb_index_id_collector *)context;
+    uint8_t *copy;
+    if (collector->out_of_memory) {
+        return false;
+    }
+    if (collector->count == collector->capacity) {
+        size_t new_capacity =
+            collector->capacity == 0U ? 8U : collector->capacity * 2U;
+        sdb_collected_id *grown = (sdb_collected_id *)realloc(
+            collector->items, new_capacity * sizeof(*grown)
+        );
+        if (grown == NULL) {
+            collector->out_of_memory = true;
+            return false;
+        }
+        collector->items = grown;
+        collector->capacity = new_capacity;
+    }
+    copy = (uint8_t *)malloc(document_id_size == 0U ? 1U : document_id_size);
+    if (copy == NULL) {
+        collector->out_of_memory = true;
+        return false;
+    }
+    if (document_id_size != 0U) {
+        (void)memcpy(copy, document_id, document_id_size);
+    }
+    collector->items[collector->count].bytes = copy;
+    collector->items[collector->count].size = document_id_size;
+    collector->count++;
+    return true;
+}
+
+sdb_status sdb_index_query_documents(
+    sdb_database *database,
+    const uint8_t *collection,
+    size_t collection_size,
+    const uint8_t *index_name,
+    size_t index_name_size,
+    const uint8_t *value,
+    size_t value_size,
+    sdb_document_visit_fn visitor,
+    void *context,
+    size_t *match_count_out
+)
+{
+    sdb_index_id_collector collector;
+    sdb_status status;
+    size_t emitted = 0U;
+    size_t index;
+    size_t visit_count = 0U;
+    if (visitor == NULL) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    collector.items = NULL;
+    collector.count = 0U;
+    collector.capacity = 0U;
+    collector.out_of_memory = false;
+
+    /*
+     * Phase 1: collect matching document ids. The visitor only copies bytes,
+     * so it never re-enters the engine — safe while sdb_index_visit holds the
+     * handle lock. sdb_index_visit requires a non-NULL match-count out param.
+     */
+    status = sdb_index_visit(
+        database, collection, collection_size, index_name, index_name_size,
+        value, value_size, sdb_index_collect_visitor, &collector, &visit_count
+    );
+    if (status == SDB_OK && collector.out_of_memory) {
+        status = SDB_E_OUT_OF_MEMORY;
+    }
+
+    /* Phase 2: the lock is released; fetch each body and hand it to caller. */
+    for (index = 0U; status == SDB_OK && index < collector.count; ++index) {
+        size_t needed = 0U;
+        size_t capacity;
+        size_t got = 0U;
+        uint8_t *body;
+        bool keep_going;
+        sdb_status read = sdb_document_get(
+            database, collection, collection_size,
+            collector.items[index].bytes, collector.items[index].size,
+            NULL, 0U, &needed
+        );
+        if (read == SDB_E_NOT_FOUND) {
+            continue; /* deleted between the two phases */
+        }
+        if (read != SDB_OK && read != SDB_E_BUFFER_TOO_SMALL) {
+            status = read;
+            break;
+        }
+        capacity = needed == 0U ? 1U : needed;
+        body = (uint8_t *)malloc(capacity);
+        if (body == NULL) {
+            status = SDB_E_OUT_OF_MEMORY;
+            break;
+        }
+        read = sdb_document_get(
+            database, collection, collection_size,
+            collector.items[index].bytes, collector.items[index].size,
+            body, capacity, &got
+        );
+        if (read == SDB_E_NOT_FOUND) {
+            free(body);
+            continue;
+        }
+        if (read != SDB_OK) {
+            free(body);
+            status = read;
+            break;
+        }
+        keep_going = visitor(
+            context, collector.items[index].bytes,
+            collector.items[index].size, body, got
+        );
+        free(body);
+        ++emitted;
+        if (!keep_going) {
+            break;
+        }
+    }
+
+    for (index = 0U; index < collector.count; ++index) {
+        free(collector.items[index].bytes);
+    }
+    free(collector.items);
+    if (status == SDB_OK && match_count_out != NULL) {
+        *match_count_out = emitted;
+    }
+    return status;
+}

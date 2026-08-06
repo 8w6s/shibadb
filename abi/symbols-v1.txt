@@ -16,6 +16,7 @@ sdb_document_get
 sdb_document_put
 sdb_free
 sdb_index_create
+sdb_index_query_documents
 sdb_index_visit
 sdb_kv_batch_apply
 sdb_kv_compare_and_swap
