@@ -10,6 +10,7 @@ option(SDB_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
 option(SDB_ENABLE_SOAK_TESTS "Enable long-running engine soak tests" OFF)
 option(SDB_BUILD_BENCHMARKS "Build the KV benchmark harness" OFF)
 option(SDB_BUILD_CLI "Build the shibadb command-line tool" ON)
+option(SDB_BUILD_EXAMPLES "Build the example programs" ON)
 option(SDB_ENABLE_FUZZERS "Build libFuzzer targets (requires Clang)" OFF)
 # A7.7: gate test-hook symbols behind SDB_TESTING. Auto-ON when tests
 # build; a release build (SDB_BUILD_TESTS=OFF, SDB_TESTING=OFF) strips
@@ -279,6 +280,21 @@ if(SDB_BUILD_CLI)
         )
     endif()
     install(TARGETS shibadb_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if(SDB_BUILD_EXAMPLES)
+    # Compilable API tour; also run as the example_quickstart test so the
+    # snippets in the docs cannot silently drift from the real API.
+    add_executable(example_quickstart examples/quickstart.c)
+    target_link_libraries(example_quickstart PRIVATE ShibaDB::core)
+    if(MSVC)
+        target_compile_options(example_quickstart PRIVATE /W4 /WX)
+    else()
+        target_compile_options(example_quickstart PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+            -Wstrict-prototypes -Wmissing-prototypes -Werror
+        )
+    endif()
 endif()
 
 if(SDB_BUILD_TESTS OR SDB_ENABLE_SOAK_TESTS)
@@ -780,6 +796,9 @@ if(SDB_BUILD_TESTS)
                 -DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}/_cli_work
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.cmake
         )
+    endif()
+    if(SDB_BUILD_EXAMPLES)
+        add_test(NAME example_quickstart COMMAND example_quickstart)
     endif()
 endif()
 
