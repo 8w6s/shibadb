@@ -1,0 +1,7 @@
+Diagnostics:
+  UnusedIncludes: None
+---
+If:
+  PathMatch: src/windows_path\.c
+Diagnostics:
+  Suppress: [empty-translation-unit]

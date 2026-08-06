@@ -1,0 +1,782 @@
+# Repository audit
+
+_Last updated: 2026-08-02 (adversarial bug-hunt, 6 fixes integrated to main)_
+
+
+Adversarial, evidence-based audit of `shibadb-c` at the commit that
+follows the generation-overflow hardening (task #25). Each subsystem
+gets its own findings table.
+
+## Classification legend
+
+Every claim below is classified by **severity** and **confidence**.
+
+Severity:
+- **CONFIRMED-BUG** — reproducible defect with a concrete failure mode.
+- **LIKELY-BUG** — plausible defect; missing evidence to reach confirmed.
+- **DESIGN-DEBT** — not a defect against the current contract, but the
+  code is fragile, easy to misuse, or blocks a needed feature.
+- **DEFENSE-IN-DEPTH** — the current path is safe under the stated
+  invariants; the finding is a hardening opportunity, not a bug.
+- **FALSE-POSITIVE** — claim was verified against source and rejected.
+
+Confidence (how sure the classifier is, independent of severity):
+`HIGH` (source + call graph + simulated crash), `MEDIUM` (source only),
+`LOW` (heuristic).
+
+Every row must cite the exact source line and, where applicable, a
+description of a test that would reproduce it.
+
+## Audit scope
+
+Subsystems, in the order they are audited:
+
+1. WAL / recovery (`src/wal.c`)
+2. Runtime txn allocate/free (`src/pager.c` — txn portion)
+3. B-tree split/merge/root (`src/btree.c`)
+4. Superblock select/update (`src/superblock.c`, `src/superblock_store.c`)
+5. Encrypted-page / key management (`src/encrypted_page.c`,
+   `src/key_manager.c`, `src/xchacha20poly1305.c`, `src/sha256.c`,
+   `src/random.c`)
+6. Replace / backup / compact (`src/replace.c`, `src/engine.c`
+   backup/compact paths)
+7. File I/O portability (`src/file.c`, `src/windows_path.c`)
+8. Page cache / concurrency (`src/page_cache.c`, `src/sync.c`)
+9. Public API / error cleanup (`src/engine.c` public entry points)
+
+## Method
+
+For each subsystem I:
+
+1. Read the source top-to-bottom.
+2. Grep every caller and callee of every non-trivial function.
+3. Simulate the event ordering: what states can a crash between any two
+   `fsync` boundaries leave on disk? What does the next open see?
+4. Try to disprove the classification before accepting it. A finding is
+   only CONFIRMED-BUG if I can name a concrete input plus point in time
+   plus resulting disk state that a subsequent open cannot reconcile.
+5. Note test coverage: is there an existing test that catches this? If
+   not, describe one before proposing a fix.
+
+Findings are neutral about author intent — the goal is disk truth, not
+attribution.
+
+---
+
+## A1. WAL / recovery (`src/wal.c`, 584 LOC)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A1.1 | `sdb_wal_id_set_insert` (`wal.c:51-67`) uses `0U` as its empty-slot sentinel and does not itself reject `page_id == 0`. Callers (`wal.c:151-166, 312-322`) filter `page_id == 0` before the call, so no in-tree bug exists. | DEFENSE-IN-DEPTH | HIGH | None today. A future caller that forgets the pre-check would silently fail to detect duplicate `page_id == 0` entries. | Add `if (page_id == 0U) return false;` at the top of the helper. Zero extra cost. |
+| A1.2 | `sdb_wal_recover` reads and validates the WAL header twice — once from a 60-byte local buffer for early rejection (`wal.c:390-420`), once from the full buffer after `malloc` + `read_full` (`wal.c:450-464`). Single-process locking makes the two reads observe the same bytes, so this is redundant but not racy. | DESIGN-DEBT | HIGH | None. Extra work per recovery. | Optional: drop the second header validation once the first passes; keep the CRC re-check inside the full-buffer path only. |
+| A1.3 | A WAL file that is present but shorter than `HEADER + COMMIT` (`wal.c:386-389`) is returned as "no WAL" without deletion. Repeated create-then-crash cycles can leave a growing pile of short WAL files. | DESIGN-DEBT | MEDIUM | Small stale-file accumulation only when the database itself keeps failing to complete its first write. | Optional: `unlink` the short file inside `sdb_wal_recover` when it fails structural checks. Beware: doing so during recovery requires the same directory-fsync care as elsewhere. |
+| A1.4 | A WAL whose magic does not match (`wal.c:397-400, 445-449`) is silently ignored. Combined with file-id binding at 407-409 and 455 this cannot be exploited to hijack recovery — any injected file must also carry the current `file_id`. | FALSE-POSITIVE | HIGH | None. | — |
+| A1.5 | `sdb_wal_apply` (`wal.c:243-292`) writes every replayed page and issues a single `fsync` at the end. A crash mid-loop leaves partial DB writes but does not advance `checkpoint_lsn`; the next recovery re-runs the exact same idempotent write set. Standard redo-WAL. | FALSE-POSITIVE | HIGH | None. | — |
+| A1.6 | `sdb_wal_open_reset` (`wal.c:91-109`) opens an existing WAL, truncates to 0, and proceeds to write the new body without an intermediate `fsync`. On crash between truncate and first body `fsync`, the on-disk file may be a mix of old-truncated and no-body. The next `sdb_wal_recover` sees either "no magic" or "size mismatch" and returns SDB_OK, dropping the old already-replayed WAL — which is correct because the caller (`sdb_txn_commit`) will set `needs_recovery` after any failure past this point. | FALSE-POSITIVE | HIGH | None. Analysis holds only because the previous WAL was already applied and cleared before this reuse; if that invariant ever breaks, revisit. | Add an explicit invariant note in `docs/WAL_FORMAT.md`: "reusing a WAL file is safe because the previous transaction is guaranteed to have been fully applied to the DB and its checkpoint recorded". |
+| A1.7 | `sdb_wal_clear` (`wal.c:556-574`) truncates the WAL to zero and fsyncs the file, but does not fsync the parent directory. On POSIX, ftruncate durability of the size change without a directory fsync is filesystem-dependent (ext4 with `data=ordered` is fine; some other configurations may not persist the size across power loss). | LIKELY-BUG | MEDIUM | On rare filesystem configurations, a crash after `sdb_wal_clear` returns SDB_OK but before the filesystem journals the truncation could leave a WAL with the old body. Next recovery would see `txn_id ≤ checkpoint_lsn` and safely skip apply (W.7), so at worst a stale WAL is left on disk until the next commit. No data loss. | Add parent-directory fsync after the truncate-fsync in `sdb_wal_clear`, mirroring `sdb_file_sync_parent_directory` calls elsewhere. Cheap. |
+| A1.8 | `sdb_wal_recover` `file_size == 0` short-circuit (`wal.c:373`) returns whatever `status` `sdb_file_size` produced (always SDB_OK when size is zero). This is fine but the ternary is confusing. | FALSE-POSITIVE | HIGH | None. | Optional readability rewrite. |
+| A1.9 | The commit trailer's CRC covers the entire body up to and including the record area but excluding the trailer (`wal.c:206-213, 518-519`). This is standard and matches SQLite's approach. | FALSE-POSITIVE | HIGH | None. | — |
+| A1.10 | Duplicate-page-id detection runs both at write (`wal.c:151-168`) and at replay (`wal.c:294-331`). A malformed WAL cannot half-apply. | FALSE-POSITIVE | HIGH | None. | — |
+
+**Summary A1**: One LIKELY-BUG (A1.7 — missing directory fsync in `sdb_wal_clear`, filesystem-dependent). Two DEFENSE-IN-DEPTH improvements (A1.1, A1.3). No confirmed data-loss or corruption path. WAL is well-designed.
+
+---
+
+## A2. Runtime txn allocate/free (`src/pager.c` — txn portion)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A2.1 | `sdb_txn_put` rejects `page_id ≥ target_superblock.next_page_id` (`pager.c:753`). After `sdb_txn_allocate` grows the file, `target_superblock.next_page_id` is bumped in-memory (`pager.c:854`) so a subsequent put of the newly-allocated id passes. Ordering is correct. | FALSE-POSITIVE | HIGH | — | — |
+| A2.2 | `sdb_txn_free` (`pager.c:872-899`) forbids freeing a page that was allocated inside the same txn (`pager.c:889-894`). This means alloc-then-free within one transaction is impossible; the caller must abort and retry. | DESIGN-DEBT | HIGH | Only affects hypothetical B-tree paths that would allocate then decide the allocation was unneeded. No such path exists today. | Document explicitly in `PAGER_INVARIANTS.md` — allocation in a txn is a one-way commitment, abort to undo. |
+| A2.3 | `sdb_txn_put` rejects duplicate `page_id` in the same batch (`pager.c:767-770`). `sdb_btree_stage` (`btree.c:120-127`) itself deduplicates in the higher-level batch and only forwards each id once to `sdb_txn_put`, so no B-tree path can hit this. | FALSE-POSITIVE | HIGH | — | — |
+| A2.4 | `sdb_txn_put` type=FREE requires payload_size == 8 and the payload's next-freelist id (`pager.c:762-766`) to be `< next_page_id` and `!= page_id`. This catches "free onto itself" cycles and out-of-range freelist chains. | FALSE-POSITIVE | HIGH | — | — |
+| A2.5 | `sdb_txn_release` (`pager.c:701-720`) only `secure_zero`s staged payloads when `encryption_enabled`. Unencrypted mode leaves the free'd payload buffers with the last-written plaintext until the allocator reclaims them. | DESIGN-DEBT | HIGH | User's data may sit in freed heap. Not a database secret — application data — but a defense-in-depth gap for callers who don't zero their input before passing it in. | Optional: unconditional `secure_zero` on release. Cost is tiny (payloads are page-sized). |
+| A2.6 | `sdb_txn_commit` invariant enforcement (`pager.c:936-950`): every id in `allocated_pages` must appear in `pages`, else reject. This is T.4 in PAGER_INVARIANTS.md and guarantees that no `next_page_id` advance ever publishes an uninitialized page. | FALSE-POSITIVE | HIGH | — | — |
+| A2.7 | On any error past `sdb_wal_write_committed`, `sdb_txn_commit` sets `pager->needs_recovery = true` (`pager.c:1044-1046`) before releasing the txn. All subsequent public operations refuse to run until the pager is closed and reopened. | FALSE-POSITIVE | HIGH | — | — |
+| A2.8 | `sdb_txn_commit` line 1029 (post-hardening in task #25) uses `sdb_generation_bump` on the real superblock's generation. This is monotone even if the txn ran for a long time and the pager superblock advanced concurrently — but the pager forbids concurrent txns, so the "real" and "target" superblocks can only diverge in the fields the txn itself mutated. | FALSE-POSITIVE | HIGH | — | — |
+
+**Summary A2**: No bugs. Two DESIGN-DEBT items (A2.2, A2.5) that are quality-of-life, not correctness. Runtime allocation is genuinely atomic via WAL.
+
+---
+
+
+## A3. B-tree split/merge/root (`src/btree.c, src/btree_page.c`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A3.1 | `sdb_btree_reclaim_empty_leaf` root-collapse path (`btree.c:352-379`) invokes `sdb_txn_free` on the surviving child of the root. `sdb_txn_free` rejects any page in `txn->allocated_pages` (`pager.c:892-895`), so if the surviving child was allocated earlier in the same batch, reclaim returns `SDB_E_INVALID_ARGUMENT` and poisons the batch. | CONFIRMED-BUG | HIGH | A legitimate batch that (1) inserts enough into one child of a 2-child root to split it (allocating a new leaf X), then (2) empties both pre-existing children so the root collapses onto X, aborts with `SDB_E_INVALID_ARGUMENT`. No corruption (pager aborts before WAL) but the workload cannot commit and must retry. | In the root-collapse branch, detect when `child_page` is in `txn->allocated_pages` and, instead of calling `sdb_txn_free`, copy the child's contents into the root slot and either drop the child from `allocated_pages` and skip the free, or route freshly-allocated pages through a distinct in-batch free path the pager accepts. Add a regression test that splits a 2-child root and empties both original children in the same batch. |
+| A3.2 | `sdb_btree_reclaim_empty_leaf` grandparent branch (`btree.c:380-409`) calls `sdb_txn_free(&batch->txn, parent_page)` after promoting `parent.first_child` up. If the parent internal node was allocated inside this batch (e.g. as the right half of an earlier `sdb_btree_split_internal`), the same `pager.c:892-895` check rejects the free and the batch is poisoned. | CONFIRMED-BUG | HIGH | A batch that splits an internal node (allocating `A_new` via `split_internal`) and later deletes every key under `A_new` so it collapses to `count=0` fails with `SDB_E_INVALID_ARGUMENT`. No corruption is committed, but the batch fails when a correct implementation would accept it. | Mirror the leaf-side guard at `btree.c:1147-1149`: before `sdb_txn_free(parent_page)` at line 405, check `sdb_btree_txn_allocated(batch, parent_page)`. If batch-allocated, unstage the parent (remove it from `batch->items`) and skip the free — the page never reached durable storage. Add a regression test mixing `batch_put` (forcing `split_internal`) with `batch_delete` on the new right half within one batch. |
+| A3.3 | `sdb_btree_reclaim_empty_leaf` grandparent branch (`btree.c:395-402`) sets `grandparent.entries[grandparent_child-1].right_child = parent.first_child` (or `grandparent.first_child`) directly, without checking that `parent.first_child` is at the same subtree height as grandparent's other children. When parent was the immediate parent of leaves, `parent.first_child` is a leaf; the grandparent now has a leaf directly next to sibling internal nodes, silently breaking the uniform-leaf-depth B+tree invariant. | CONFIRMED-BUG | HIGH | 3-level tree with `root->(A,B)` internals, each with 2 leaves. Delete the single key in `L_B1`. Reclaim empties parent B, then grandparent branch replaces root's slot for B with `B.first_child = L_B2` (a leaf). Root now mixes A (internal, leaves at depth 3) with `L_B2` (leaf at depth 2). `sdb_btree_verify_node` (`btree.c:1525-1528`) returns `SDB_E_CORRUPT`. Cursor/Get still work but the tree no longer satisfies `BTREE_FORMAT.md`'s implicit uniform-depth contract and further splits anchor the ragged structure permanently. | Only promote `parent.first_child` in place of parent when parent is the immediate parent of leaves AND grandparent's other children are also leaves (the whole depth-1 level is collapsing uniformly). Otherwise perform a real merge/borrow with a sibling of parent, or leave parent as a valid single-child internal (with a corresponding `verify_node` relaxation). Safest minimal fix: refuse to collapse an internal with `count==0` unless its sibling subtree can be merged. |
+| A3.4 | A batch that frees a page (delete-triggered reclaim) and then allocates (insert-triggered split) inside the same transaction fails: `sdb_txn_free` updates `target_superblock.freelist_page` to the just-freed page (`pager.c:906`) but stages the FREE record only in `txn->pages`. `sdb_txn_allocate` (`pager.c:832-843`) pops the freelist head via `sdb_pager_read`, which returns the DISK content — still the old DATA/type of the just-freed page — and rejects it with `SDB_E_CORRUPT` because `view.type != SDB_PAGE_TYPE_FREE`. | CONFIRMED-BUG | HIGH | Any b-tree batch pattern of `delete-that-reclaims + subsequent-insert-that-splits` fails with `SDB_E_CORRUPT` — a misleading error since nothing is actually corrupt. Failure short-circuits before `sdb_wal_write_committed`, so `needs_recovery` is NOT set and no disk state changes; the user must abort and retry. Blocks a very common mixed-workload pattern. | Make `sdb_txn_allocate` resolve a freelist-head read from the transaction's in-memory staging first: before calling `sdb_pager_read`, search `txn->pages` for the `freelist_page` id — if present with type `SDB_PAGE_TYPE_FREE`, read `next_freelist` from that staged payload and skip the disk read (also unstage it). Alternative: teach `sdb_txn_free` to poke the pager cache with an encoded FREE page image. Add a regression test that in one transaction reclaims and then splits. |
+| A3.5 | `sdb_btree_batch_delete` (`btree.c:1123-1125`) sets `batch->failure = SDB_E_NOT_FOUND` when the key is absent, which poisons the entire batch and forces the caller to abort. This makes delete non-idempotent in a multi-op batch: attempting to delete a possibly-missing key rolls back every previously staged put/delete. | DESIGN-DEBT | HIGH | Callers wanting delete-if-exists semantics must either check with `batch_get` first (extra descent) or wrap each delete in its own batch (extra commit cost). Compared to standard KV APIs (LevelDB, RocksDB) this is surprising behavior. | Return `SDB_E_NOT_FOUND` to the caller without setting `batch->failure` when the key is absent (a no-op delete), so the batch remains committable. Alternatively add an explicit `sdb_btree_batch_delete_if_exists` variant. Document the current sticky-failure semantics in the header regardless. |
+| A3.6 | `sdb_btree_reclaim_empty_leaf`'s predecessor descent (`btree.c:306-326`) is an unbounded `for(;;)` loop that walks `child_at(&predecessor, predecessor.count)` until it hits a leaf. Decode enforces non-zero child pointers (`btree_page.c:71-74, 138-142`) but does NOT check for self-referential or cyclic internal pointers. | DEFENSE-IN-DEPTH | HIGH | A corrupt on-disk internal page whose `entries[count-1].right_child` equals its own page id would trap the reclaim loop in an infinite read-decode-destroy cycle. The pager's page-id-mismatch check (P.5) catches self-referential single-page loops via `view.page_id` validation, but a cycle across two pages (A -> B -> A) would not be detected. Requires malicious/corrupt on-disk state. | Add a depth cap (e.g., current tree height + small slack) or a visited-page bitset to the descent loop in `sdb_btree_reclaim_empty_leaf`; return `SDB_E_CORRUPT` on overflow. Same hardening should apply to any other unbounded child-pointer walk. |
+| A3.7 | `sdb_btree_insert_recursive` (`btree.c:705-786`) has no depth cap on its self-recursion, while `sdb_btree_batch_delete` enforces `depth >= 64U → SDB_E_CORRUPT` (`btree.c:1183-1187`). A corrupt tree with a cyclic parent->child pointer or deeper-than-expected fan-out could stack-overflow insert. | DEFENSE-IN-DEPTH | MEDIUM | Corrupt tree + insert triggers unbounded C-stack recursion. Not reachable from clean pages but is the symmetric counterpart to the delete-path check. | Add a depth parameter (or explicit counter) to `sdb_btree_insert_recursive` and abort with `SDB_E_CORRUPT` once it exceeds the same 64-level cap used by `sdb_btree_batch_delete`, mirroring the existing corruption sentinel. |
+| A3.8 | `sdb_btree_cursor_next` (`btree.c:1432-1434`) and `sdb_btree_cursor_descend` (`btree.c:1313-1316`) recursively call `sdb_btree_cursor_next` when an empty leaf is encountered mid-traversal. The recursion depth is bounded by the number of consecutive empty leaves in the linked list, which is unbounded — a batch that allocates many leaves and empties them within the same txn (reclaim SKIPPED by the `txn_allocated` guard at `btree.c:1149`) commits them as empties and lets the linked list contain arbitrarily many consecutive empty nodes. | DESIGN-DEBT | MEDIUM | Deep C-stack recursion during ordinary cursor traversal on a database that has accumulated empty leaves within batches. Realistic ceiling is hundreds to low thousands (tail-call optimization may hide it on optimized builds but is not guaranteed). | Rewrite `cursor_next`'s empty-sibling skip and `cursor_descend`'s fallthrough as an iterative loop so the frame count is O(1) regardless of consecutive-empty-leaf count. Optional supplement: teach `batch_commit` to sweep leaves in `allocated_pages` that ended the batch with `count=0` by rewriting the parent to bypass them before commit. |
+| A3.9 | `sdb_btree_split_internal` (`btree.c:610-703`) can pick a middle where `left.count = middle = 0` or `right_count = left->count - middle - 1 = 0`. When called on a `count=2` internal node — the smallest allowed by the guard at `btree.c:773` — BOTH remaining candidates (`middle=0` and `middle=1`) leave one side with zero entries; the loop has no fallback. The resulting internal has only `first_child`. It encodes/decodes cleanly (`btree_page.c:170-201` allows `count=0` for internal so long as `first_child != 0`) and stages successfully (`btree.c:106`), but `sdb_btree_verify_node` explicitly rejects `node.count == 0U` at `btree.c:1538`. Contrast with `split_leaf` (`btree.c:540-568`), whose candidate loop starts at 1 and rejects `middle==0` — an asymmetry that lets the internal split produce a shape the verifier considers corrupt. | DESIGN-DEBT | HIGH | Triggerable with near-half-page separator keys (~capacity/2 each) when an internal node reaches `count=2` and overflows. On a 4KB page: insert three ~2KB keys with small values into an empty tree; the second insert splits the leaf (yielding a ~2KB separator and a count=1 root internal), the third insert splits another leaf and pushes root internal to `count=2` over capacity, triggering `split_internal`, which produces a `count=0` internal that the new-root logic in `batch_put` installs as `first_child`. The committed tree remains functional for Get/Put (lower_bound returns 0 and descends `first_child`), but any subsequent `sdb_btree_verify` call returns `SDB_E_CORRUPT` permanently. | Either (a) mirror `split_leaf`'s constraint: refuse `middle=0` and `middle=count-1` in `split_internal`, forcing a proper two-way split and returning `SDB_E_BUFFER_TOO_SMALL` when `count<3` (propagating to `insert_recursive` as a valid failure — same policy as the existing `count<2` guard at `btree.c:773`); or (b) tighten the `count<2` guard at `btree.c:773` to `count < 3` for internal-node splits. Option (a) matches `split_leaf`'s shape and is the minimal fix. Add a unit test with `page_size=4096` that inserts three ~2KB keys and calls `sdb_btree_verify`. |
+| A3.10 | `sdb_btree_split_leaf` uses `middle = 0U` as the initial 'no valid split found' sentinel and returns `SDB_E_BUFFER_TOO_SMALL` when the loop leaves it at 0 (`btree.c:566-568`). A naive reader could suspect that a legitimate `middle == 0` split (empty left) is silently rejected. Verified: the candidate loop starts at `candidate = 1` (`btree.c:548`), so `middle` can only be assigned values >= 1, and 0 is unambiguously the 'unset' state. | FALSE-POSITIVE | HIGH | None. | — |
+| A3.11 | `sdb_btree_split_leaf` shallow-copies `entries[middle..count-1]` into `right` via memcpy (`btree.c:580-584`), then sets `left->count = middle` (`btree.c:585`). A naive reader might worry about double-free between left's and right's `node_destroy`. Verified: destroy iterates `entries[0..count-1]` only, so with `left->count` set to `middle` before allocate/stage, left owns `entries[0..middle-1]` and right owns the shallow copies at `entries[middle..]`. No overlap; no double-free. | FALSE-POSITIVE | HIGH | None. | — |
+| A3.12 | `sdb_btree_batch_put` root-split path (`btree.c:1041-1081`) constructs `new_root` with `new_root.entries = &root_entry` where `root_entry` is a stack local. A naive reader might expect stage to retain the pointer. Verified: `sdb_btree_stage` (`btree.c:109-115`) mallocs its own payload buffer and encodes into it via `sdb_btree_node_encode`, which copies key/value bytes; the pointer is not retained beyond the call. | FALSE-POSITIVE | HIGH | None. | — |
+
+**Summary A3**: A3 surfaced 4 CONFIRMED-BUGs (A3.1, A3.2, A3.3, A3.4), 0 LIKELY-BUGs, and 3 DESIGN-DEBT items (A3.5, A3.8, A3.9), plus 2 DEFENSE-IN-DEPTH gaps (A3.6, A3.7) and 3 FALSE-POSITIVEs (A3.10-A3.12). The four confirmed bugs cluster around the same architectural seam — the b-tree freely calls `sdb_txn_free`/`sdb_txn_allocate` on pages allocated in the same batch, but the pager's transaction layer refuses to free in-batch allocations (A3.1, A3.2) and refuses to allocate from an in-batch freed page (A3.4), and the reclaim path collapses non-uniform subtrees without a merge/borrow step (A3.3). None corrupt on-disk state (all fail before WAL write), but any real mixed insert/delete workload can hit A3.1, A3.2, or A3.4 and be forced to abort/retry, and A3.3 silently produces a `verify`-rejecting tree that persists across commits. A3.9 is also fully reproducible with a specific key-size recipe and permanently poisons `verify`. Recommend prioritizing A3.1-A3.4 as a coherent fix to the batch/pager interaction, then A3.3 and A3.9 as verifier-invariant fixes, before addressing the ergonomic and defense-in-depth items.
+
+---
+
+## A4. Superblock select/update (`src/superblock.c, src/superblock_store.c`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A4.1 | `sdb_validate_superblock` rejects an all-zero salt unconditionally, but PAGER_INVARIANTS.md S.7 explicitly states "salt is not zero-checked in the unencrypted case". The code is stricter than the documented contract. (`src/superblock.c:41-44`, `docs/PAGER_INVARIANTS.md:152-158`) | DESIGN-DEBT | HIGH | A caller that constructs an unencrypted `sdb_superblock_v1` with an all-zero salt (e.g. a test harness, a fuzz corpus builder, or an application that treats salt as an unused field per the docs) gets `SDB_E_INVALID_ARGUMENT` from encode and `SDB_E_CORRUPT` from decode, contrary to the stated contract. On-disk validation is safe; only the API contract diverges. | Either (a) relax the salt zero-check in `sdb_validate_superblock` to fire only when `SDB_FLAG_ENCRYPTED` is set — matching the documented S.7 contract — or (b) update PAGER_INVARIANTS.md S.7 to state salt must be non-zero in both modes. Option (a) is preferred since salt is documented as unused in the unencrypted case, so fuzzers and minimal test fixtures should not need to populate it. |
+| A4.2 | `sdb_superblock_store_read_file` silently masks any I/O error on a single slot read as "slot invalid". A transient hardware error on one mirror is indistinguishable from a torn/corrupt mirror to the caller. (`src/superblock_store.c:68-83`, `src/pager.c:136-141`) | DESIGN-DEBT | HIGH | If slot 0's `sdb_file_read_full` returns `SDB_E_IO` (media fault, EIO from the block layer) but slot 1 decodes cleanly, the function returns `SDB_OK` with `valid_mirror_count=1`. The pager (`src/pager.c:136`) does not inspect `valid_mirror_count`, so an operator has no signal that the underlying device is failing. The database keeps running on a single mirror until the next update overwrites the bad slot's sector — which may or may not succeed on failing hardware. | Distinguish transient I/O errors from decode/padding failures at slot granularity: either propagate `SDB_E_IO` out of `read_file` when at least one slot read fails with an I/O error (letting the caller decide), or add a degraded-mirror flag/log hook so operators learn of one-sided hardware faults before the next update. At minimum, have `sdb_pager_open_encrypted` log or expose `result.valid_mirror_count<2` so monitoring can catch failing media early. |
+| A4.3 | When `sdb_superblock_store_read_file` returns `valid_mirror_count == 1`, the pager open path does not rewrite the corrupt mirror before returning a usable handle. The database runs in a single-mirror-degraded state until the next superblock update. (`src/superblock_store.c:87-100`, `src/pager.c:136-141`, `docs/PAGER_INVARIANTS.md:119-131`) | DESIGN-DEBT | HIGH | Concrete scenario: open a database whose slot 1 is corrupt from a prior torn write; open returns `SDB_OK` using slot 0. If a second crash lands before any `sdb_pager_advance_superblock` call (i.e. the app only reads for hours or performs no ops that bump generation) and that crash tears slot 0, both mirrors are now unreadable -> `SDB_E_CORRUPT` permanently. A healing write at open time would close this window. | In `sdb_pager_open_internal` after `sdb_superblock_store_read_file` succeeds, if `result.valid_mirror_count == 1`, issue an immediate re-write of the current superblock via `sdb_superblock_store_update_file` (or a dedicated heal routine that writes the corrupt slot only, preserving generation) and fsync before returning the handle. This restores 2-mirror redundancy at open, eliminating the read-only degraded-window class of failures. |
+| A4.4 | `sdb_superblock_store_update_file` does not verify that fields the caller expects to be immutable across the file's lifetime (`file_id`, `salt`, `page_size`) actually match `current.superblock`. A buggy or malicious caller can silently change these fields as part of a normal-looking update. (`src/superblock_store.c:195-237`, `docs/PAGER_INVARIANTS.md:133-136`, `src/pager.c:1027-1033`) | DEFENSE-IN-DEPTH | HIGH | In-tree callers (`pager.c:1027-1032` for commit, `pager.c:410/636/698` for allocate/free/rotate) always start from `pager->superblock` and mutate specific fields, so `file_id`/`salt`/`page_size` are preserved. But a future caller that constructs a superblock from scratch and passes it through this API could rewrite `file_id`, breaking S.4 (encrypted-page AAD and WAL binding) with no signal from the update path. Detection then happens only at the next encrypted page decrypt or WAL replay, where the AEAD tag fails — corruption looks like an authentication failure with no attribution. | Add a guard in `sdb_superblock_store_update_file` that, after reading `current.superblock`, rejects with `SDB_E_INVALID_ARGUMENT` if `superblock->file_id`, `superblock->salt`, or `superblock->page_size` differ from `current.superblock`'s equivalents. This turns S.4 (`docs/PAGER_INVARIANTS.md:133-136`) into an enforced runtime check and preserves attribution: a future faulty caller sees the error at the update boundary rather than as an AEAD failure surfaced far downstream. |
+| A4.5 | `sdb_superblock_v1_decode` collapses every field-level validation failure into `SDB_E_CORRUPT` (via `sdb_validate_superblock` at line 181), losing the ability to distinguish "bad page_size" from "bad flags" from "bad encryption fields". Same information loss on encode via `SDB_E_INVALID_ARGUMENT`. (`src/superblock.c:25-68`, `src/superblock.c:181-183`) | DEFENSE-IN-DEPTH | HIGH | Diagnostic-only. An operator inspecting a corrupt superblock cannot tell whether the CRC was wrong, the header size was wrong, a reserved byte was non-zero, or a validated field was out of range. Not a correctness issue — every failure mode is a legitimate corruption from the decoder's perspective. | Optionally split `sdb_validate_superblock` into per-field checks that return distinct sub-codes, or add a caller-supplied out-parameter capturing which field failed, so operator tooling can surface actionable diagnostics without changing the public status enum. |
+| A4.6 | `sdb_superblock_store_create` calls `sdb_file_resize` before the first `sdb_file_sync`, and `sdb_file_resize` itself does not fsync. A crash between resize and the first fsync leaves the on-disk state undefined; the design relies on the parent-directory fsync at the end being the only durable point of the file's existence. (`src/superblock_store.c:120-138`, `src/file.c:550-563`) | DEFENSE-IN-DEPTH | HIGH | On POSIX the `ftruncate` is durable only after a subsequent fsync of the file, and the create's directory entry is durable only after `sdb_file_sync_parent_directory` at line 141. So the crash windows are: (a) crash between `create_new` and first fsync -> parent dir not fsynced yet, so file typically vanishes on reboot (correct); (b) crash after first fsync but before second -> both slots durable-or-not depending on FS, parent dir still not fsynced, so directory entry may or may not survive. If it does survive with only slot 0 durable, the reader accepts it (see A4.7) — that state is equivalent to a fully-completed create because slot 0 == slot 1 by construction here. Safe today, but relies on interleaving of resize/write/fsync. | Document (or codify with a comment near lines 120-141) the reliance on slot-0 == slot-1 identity on create plus the parent-directory fsync as the sole existence barrier. Consider adding an explicit fsync after `sdb_file_resize` before the first write so that later refactors that change slot content between writes do not silently break this pattern. |
+| A4.7 | FALSE-POSITIVE: The error-path comment at `src/superblock_store.c:143-147` claims that after a mid-create crash "readers reject it because neither mirror validates". That claim is not accurate: if the first fsync succeeded (slot 0 durable) and the parent directory later becomes durable, the next reader sees a valid slot 0 and returns `SDB_OK`. The comment is misleading; the behavior is nonetheless safe because slot 0 and slot 1 are encoded from the identical superblock, so any partially-completed create produces a state indistinguishable from a fully-completed create. (`src/superblock_store.c:120-152`) | FALSE-POSITIVE | HIGH | None functionally. The partial-create file is a valid, empty database exactly as if the create had succeeded. The application layer sees the same result either way; the only "cost" is that a caller who thought create had failed may find the file exists on retry (which is caught by `O_EXCL`). Investigated as a bug, verified safe by construction. | Optional: rewrite the comment to reflect reality — e.g. "A crash may still leave the file present; because both slots are encoded from the same superblock, any partial state either fails to decode (before slot 0 is durable) or is indistinguishable from a successful create (after slot 0 is durable), so no corruption is possible." No code change required. |
+| A4.8 | FALSE-POSITIVE: `sdb_slot_padding_is_zero` looks like a redundant check when a naive reader assumes the CRC covers the whole 4096-byte slot. It does not: `sdb_crc32` in encode (line 110) and decode (line 146) covers only the first `SDB_SUPERBLOCK_HEADER_SIZE` (160) bytes. The padding-zero check is the only defense against non-CRC-covered corruption in bytes 160-4095. (`src/superblock_store.c:42-53`, `src/superblock.c:110-113`, `src/superblock.c:143-149`) | FALSE-POSITIVE | HIGH | None — the check is correct and load-bearing. Its combination with (a) encoder memset of the full `output_size` (line 88) and (b) padding-zero check on read gives torn-write safety at sector granularity without paying the cost of a 4KB CRC. Verified against source; the naive-reader concern is refuted. | — |
+| A4.9 | FALSE-POSITIVE: The same-generation split-brain rejection at `src/superblock_store.c:87-91` looks unreachable given S.2's strictly-monotonic generation invariant. It is not: a race between two writer processes lacking a lock, or a bug that produces two independent updates with the same next-generation value (e.g., two callers both computing `pager->superblock.generation + 1` without serialization), would produce exactly this state. (`src/superblock_store.c:87-91`, `docs/PAGER_INVARIANTS.md:129-131`) | FALSE-POSITIVE | HIGH | None — the check is intentional defense against writer races and internal misuse. Removing it would silently accept split-brain and return one arbitrary slot, hiding data loss. | — |
+| A4.10 | FALSE-POSITIVE: `sdb_superblock_store_read_file` always reads both slots even when slot 0 decodes cleanly, which looks wasteful. In fact it is required: the function must observe both slots to detect split-brain (S.3) and to select the higher-generation slot when both are valid but slot 1 has advanced (the common state after a partial mirror update). (`src/superblock_store.c:68-100`, `docs/PAGER_INVARIANTS.md:129-131`) | FALSE-POSITIVE | HIGH | None — the design is correct. Two 4KB reads per open (one syscall each after page-cache warms) is trivial cost. Skipping the second read would break S.3 and mis-select the older mirror after any partial-mirror-update crash. | — |
+
+**Summary A4**: All ten findings were CONFIRMED by the verifier. No CONFIRMED-BUG or LIKELY-BUG items surfaced: three DESIGN-DEBT items (A4.1 API/doc contract mismatch on the salt zero-check, A4.2 I/O-vs-corruption conflation on slot read, A4.3 absent open-time mirror healing) identify real operational and robustness gaps that let the store silently run degraded or diverge from the documented contract; three DEFENSE-IN-DEPTH items (A4.4 missing immutable-field guard in the update path, A4.5 collapsed decode error codes, A4.6 create-path fsync ordering fragility) harden the module against future refactors and misuse without fixing a currently-triggerable defect; and four FALSE-POSITIVE items (A4.7 misleading-comment observation, A4.8 padding-zero check, A4.9 split-brain rejection, A4.10 always-read-both-slots) confirm load-bearing defensive code that only looked suspicious on cursory inspection. Overall the subsystem is correctness-solid but has clear operability and API-hardening headroom, with A4.3 the highest-leverage improvement since it closes a real (if narrow) two-crash data-loss window.
+
+---
+
+## A5. Encrypted-page / key management (`src/encrypted_page.c, src/key_manager.c, src/xchacha20poly1305.c, src/sha256.c, src/random.c`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A5.1 | PBKDF2 minimum iteration count (SDB_MIN_KDF_ITERATIONS = 10000, `include/shibadb.h:24`) is one to two orders of magnitude below the OWASP 2023 recommendation of 600000 for PBKDF2-HMAC-SHA256. A caller creating a fresh database with `kdf_iterations = 10000` obeys the checks in `src/pager.c:311-312` and `src/key_manager.c:42-43` yet ships a weak password derivation. The wrap-key AAD binds `kdf_iterations` (E.6, `key_manager.c:23`), so an attacker who steals a database file can trivially brute-force with the persisted low count. | DESIGN-DEBT | HIGH | Passwords derived at the floor take ~30ms/guess on modern hardware; a typical dictionary attack is feasible against operator-chosen `kdf_iterations = SDB_MIN_KDF_ITERATIONS`. There is no self-tuning or benchmark helper. | Raise `SDB_MIN_KDF_ITERATIONS` to 600000 to match `SDB_DEFAULT_KDF_ITERATIONS` and the OWASP 2023 guidance, or expose an `sdb_kdf_benchmark()` helper that calibrates iterations to a target derivation time (e.g. 100-500ms) so operators do not have to hard-code a value. If the low floor must be retained for legacy compatibility, gate it behind an explicit `SDB_ALLOW_WEAK_KDF` flag on `sdb_pager_create_encrypted` / `sdb_pager_rotate_password` and document the risk in `PAGER_INVARIANTS.md` S.7. |
+| A5.2 | `sdb_random_bytes_getrandom` only falls back to `/dev/urandom` when `getrandom(2)` returns `ENOSYS` (`src/random.c:43`). The header comment at lines 26-32 explicitly justifies the fallback for a seccomp filter that blocks the syscall, yet real-world seccomp policies frequently deny via `EPERM` or `EACCES` (SECCOMP_RET_ERRNO), not `ENOSYS`. On such a policy the function returns `SDB_E_IO` with no urandom fallback, breaking `sdb_encrypted_page_encode` and password wrapping. | DEFENSE-IN-DEPTH | HIGH | On a seccomp-hardened container that returns EPERM for `getrandom`, every encrypted write and every rotate/create-encrypted operation fails at line 65 of `encrypted_page.c` despite `/dev/urandom` being readable. Users of the library cannot easily distinguish this from a hard entropy exhaustion. | Broaden the fallback trigger in `sdb_random_bytes_getrandom` to also treat `EPERM` and `EACCES` (and arguably any errno except `EFAULT`/`EINVAL`) as "syscall unavailable", returning `SDB_E_INTERNAL` so `sdb_random_bytes` retries via `/dev/urandom`. Alternatively, unconditionally attempt the urandom path on any failure and only surface an error if both sources fail; then distinguish the seccomp case in an error log so operators can diagnose it. |
+| A5.3 | FALSE-POSITIVE: `sdb_constant_time_equal` (`src/sha256.c:186-196`) accumulates a XOR difference into a non-volatile `uint8_t difference` and iterates the full length before comparing against zero. The implementation is correct in a naive compilation model, but the accumulator is not marked `volatile` and there is no compiler barrier before the boolean return. A sufficiently aggressive optimizer (LTO, PGO with branch-tracing) could theoretically hoist an early-exit on `difference != 0` if it proved the semantics equivalent for the caller. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A5.4 | `sdb_xchacha_setup` can return `SDB_E_INVALID_ARGUMENT` when `key == NULL \| nonce == NULL` (`src/xchacha20poly1305.c:380-386`), but every caller discards the return with `(void)sdb_xchacha_setup(...)` (lines 437, 480). If arguments were ever null the callers would then run `sdb_chacha_block` and the AEAD tag over uninitialized `subkey` and `ietf_nonce`. Today the encrypt/decrypt entry points validate key/nonce at lines 430 and 473 before calling setup, so setup never sees a NULL — the bug is unreachable. | DEFENSE-IN-DEPTH | HIGH | None today. If a future refactor introduces a caller that skips the validation, the `(void)` cast masks the failure and the code proceeds with garbage subkey/nonce — a silent key/nonce corruption that verifies to a garbage MAC on the other side. | Either propagate the setup return (drop the `(void)` cast and return the status) or make setup an assertion/precondition helper that cannot fail — the current asymmetry between an error-returning helper and callers that ignore the error is a footgun for future refactors. |
+| A5.5 | `sdb_key_wrap` writes directly into caller-provided `superblock->wrapped_key` and `superblock->key_wrap_tag` (`src/key_manager.c:64-67`) before the caller has committed the new superblock. If `sdb_xchacha20poly1305_encrypt` were to gain a mid-execution failure path in the future (today it only fails via early-return `SDB_E_INVALID_ARGUMENT` before any write, so this is unreachable), the superblock local would be left half-updated — partial ciphertext + old tag, or new ciphertext + stale tag. In `sdb_pager_rotate_password` (`pager.c:400-411`) the mutation is contained in a local `next` and discarded on error, so no on-disk state is affected today. | FALSE-POSITIVE | HIGH | None today because (a) AEAD encrypt has no mid-execution failure branch, and (b) the caller performs the mutation on a local `next` copy and only advances the on-disk superblock after success. The finding is documentation-only: the safety depends on the AEAD contract not changing. | Keep as documentation-only guidance. If future AEAD implementations acquire mid-execution failure paths, either have them write to a temporary buffer and copy on success, or have `sdb_key_wrap` stage `wrapped_key`/`key_wrap_tag` into local buffers before assigning into `*superblock`. |
+| A5.6 | The XChaCha20-Poly1305 construction in `sdb_xchacha20poly1305_encrypt` is textbook encrypt-then-MAC per RFC 8439: plaintext is XORed with the ChaCha20 keystream starting at counter=1 (lines 439-448); the Poly1305 one-time key is the first 32 bytes of the ChaCha20 block at counter=0 (lines 438, 449-451); the tag is computed over `AAD \| pad16 \| ciphertext \| pad16 \| len(AAD)\|len(CT)` (`src/xchacha20poly1305.c:389-414`). Decrypt verifies the tag with constant-time compare BEFORE writing any plaintext byte (lines 480-500). This matches E.5 of `PAGER_INVARIANTS.md`. | FALSE-POSITIVE | HIGH | None. | — |
+| A5.7 | Data-page nonce generation (`src/encrypted_page.c:65-72`) draws a fresh 24-byte random value from the OS CSPRNG per encrypt call. The 192-bit XChaCha nonce space makes accidental collisions negligible even under the entire realistic lifetime of a database. If `sdb_random_bytes` fails, the encrypt is aborted with a secure-zeroed payload buffer and no ciphertext is written (lines 66-72). No deterministic-nonce fallback exists that could cause reuse. | FALSE-POSITIVE | HIGH | None. | — |
+| A5.8 | Wrap-key nonce is deterministic (`file_id \| key_wrap_id_u64_le`, `key_manager.c:5-11`). Uniqueness across rotations depends on `key_wrap_id` being strictly incremented per S.8; `sdb_pager_rotate_password` refuses to run when `key_wrap_id == UINT32_MAX` (`pager.c:397`) and always bumps by exactly one (`pager.c:401`). `file_id` is a 16-byte random assigned once at create (`docs/PAGER_INVARIANTS.md:133-136`). Nonce reuse is therefore impossible unless an operator forcibly copies `wrapped_key` bytes between databases — which is out of scope. The wrap-key AAD binds both `key_wrap_id` and `kdf_iterations` (`key_manager.c:22-23`), so downgrade attacks on either fail MAC verification. | FALSE-POSITIVE | HIGH | None. | — |
+| A5.9 | On MAC verification failure inside `sdb_xchacha20poly1305_decrypt`, no byte of the caller's `plaintext` buffer is written: the constant-time compare at line 485 is reached BEFORE the `sdb_chacha_xor` at line 493, and the function returns `SDB_E_CORRUPT` after secure-zeroing scratch state (lines 486-491). `sdb_encrypted_page_decrypt` propagates this without setting the `*plaintext_size_out` / `*plaintext_type_out` out-parameters (`encrypted_page.c:166-169`). No plaintext leak on decrypt failure. | FALSE-POSITIVE | HIGH | None. | — |
+| A5.10 | The 40-byte per-page AAD constructed in `sdb_encrypted_aad` (`encrypted_page.c:10-25`) has a 2-byte gap between the `plaintext_type` u16 at offset 32 and the `plaintext_size` u32 at offset 36. Bytes 34-35 are pre-zeroed by the `memset(aad, 0, 40)` at line 19 and are never touched again, so both encrypt and decrypt sides deterministically hash the same 40-byte pattern. Not exploitable — the padding is stable across the AEAD. | FALSE-POSITIVE | HIGH | None. | No action required. Optionally, one could pack the AAD as 38 bytes (drop the gap) for a marginal micro-optimization, but this would be a format change requiring version gating and is not worth it. |
+| A5.11 | `sdb_encrypted_page_encode` always calls `sdb_random_bytes(nonce, 24)` — even when re-encoding a page whose plaintext is identical to the previous version. Combined with the AAD binding `page_lsn` (`encrypted_page.c:22`), this means every re-write of the same logical page produces a fresh nonce AND a fresh AAD. This is invariant E.3 in `PAGER_INVARIANTS.md` and prevents any nonce-reuse across a page's lifetime. | FALSE-POSITIVE | HIGH | None. | — |
+| A5.12 | `sdb_pbkdf2_hmac_sha256` (`src/sha256.c:248-312`) mallocs a single `salt_size + 4` byte scratch buffer for the salt\|\|block-index message and secure-zeroes it before free on both the success path (lines 309-310) and the block-overflow path (lines 301-302). If `malloc` returns NULL the function returns `SDB_E_INTERNAL` with no residual state. `u` and `result` local buffers are zeroed after every block iteration (lines 306-307). No key material survives the function. | FALSE-POSITIVE | HIGH | None. | No action required. |
+
+**Summary A5**: Twelve findings triaged: zero CONFIRMED-BUG, zero LIKELY-BUG, one DESIGN-DEBT (A5.1 — the PBKDF2 minimum-iteration floor of 10000 is one to two orders of magnitude below OWASP 2023 guidance and is authenticated into the wrap-key AAD, so an operator who picks the floor ships a persistently weak KDF), and two DEFENSE-IN-DEPTH items (A5.2 — `getrandom` fallback only triggers on `ENOSYS`, missing realistic seccomp `EPERM`/`EACCES` policies; A5.4 — `sdb_xchacha_setup`'s error return is discarded via `(void)` cast, currently unreachable but a footgun for future refactors). The remaining nine (A5.3, A5.5–A5.12) are FALSE-POSITIVEs — the XChaCha20-Poly1305 AEAD construction, encrypt-then-MAC ordering with tag-verified-before-plaintext-write decryption, random 24-byte data-page nonces, deterministic-but-monotonic wrap-key nonces bound to `file_id||key_wrap_id`, stable 40-byte per-page AAD binding `page_lsn`, and PBKDF2 secure-zero coverage are all correctly implemented; A5.3's speculative constant-time-equal concern is self-refuting against current toolchains. Overall the A5 subsystem is cryptographically sound; the only material action item is raising the PBKDF2 floor.
+
+---
+
+## A6. Replace / backup / compact (`src/replace.c, src/engine.c backup/compact paths`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A6.1 | In the compact hot-swap path, if `sdb_replace_finish` succeeds at removing `<db>.wal` (`replace.c:164`) but then fails at either the intermediate dir-sync (`replace.c:167`), the marker unlink (`replace.c:170`), or the final dir-sync (`replace.c:173`), the caller of `sdb_database_compact_unlocked` (`engine.c:2967-2974`) still proceeds through the in-memory pager hot-swap unconditionally because `replaced` is already true. The marker remains on disk; the pager continues to run with the new DB at `database->path` and its live WAL at `<database->path>.wal`. On the next open, `sdb_pager_open` runs `sdb_replace_recover` (`pager.c:142`) BEFORE `sdb_wal_recover` (`pager.c:180`). Recovery finds the leftover marker, its `replacement_file_id` matches the current DB's `file_id`, and finish is re-invoked — deleting the (now live) WAL before replay. | LIKELY-BUG | MEDIUM | Concrete failure: (1) compact completes rename but finish fails at any step past wal-remove (transient EIO/ENOSPC on unlink or a directory-fsync error); (2) caller sees error but the DB is hot-swapped and functional; (3) user commits transaction T (WAL body+trailer durably fsynced per T.3, DB pages fsync pending); (4) crash before the DB-page fsync of that commit completes — a T.7 crash window that WAL replay is supposed to reconstruct; (5) on reopen, `sdb_replace_recover` unlinks `<db>.wal` before `sdb_wal_recover` can read it; (6) T is silently lost, violating T.7 and X.1. | On any non-OK from `sdb_replace_finish` after `replaced=true`, set a `needs_recovery`-equivalent flag on the swapped-in pager and refuse further writes until close/reopen, and/or guarantee finish is idempotent by ordering marker-unlink+dir-sync BEFORE wal-remove so that a leftover marker never coexists with a post-swap live WAL. Alternatively, make `sdb_replace_recover` skip finish (or only remove the marker) when a live WAL is present past the point implied by the recovered checkpoint LSN. |
+| A6.2 | `sdb_replace_recover` treats ANY failure of `sdb_file_open_existing(marker_path, ...)` as 'no marker present' and returns SDB_OK (`replace.c:213-217`). `sdb_file_open_existing` on POSIX and Windows collapses every error path (ENOENT, EACCES, EIO, EMFILE, sharing violation, etc.) into `SDB_E_IO` (`file.c:402-414`, `file.c:70-73`). There is no distinction between 'marker file does not exist' and 'marker file exists but I could not read it'. | DEFENSE-IN-DEPTH | MEDIUM | If the marker file exists but open fails (permission bit dropped, transient IO error, another process holds an exclusive share on Windows), the pending replacement is silently skipped. The pager then proceeds to open the DB and replay whatever WAL happens to be there, without executing the finish/abort branch dictated by the marker's presence. In practice the leftover marker will be replaced by the next backup/compact attempt or eventually rejected by CRC — but the recovery contract of 'observe the marker or fail' is not upheld. | Extend `sdb_file_open_existing` (or add a companion `sdb_file_probe_existing`) that distinguishes 'not found' from other IO errors — e.g. return `SDB_E_NOT_FOUND` for ENOENT/ERROR_FILE_NOT_FOUND/ERROR_PATH_NOT_FOUND and reserve `SDB_E_IO` for genuine failures. Then `sdb_replace_recover` should treat only 'not found' as SDB_OK and propagate every other error so the pager refuses to open with an ambiguous marker state. |
+| A6.3 | A corrupt marker file makes the database permanently unopenable. `sdb_replace_recover` returns whatever `sdb_replace_marker_decode` returns (`replace.c:220-223, 237`). Decode returns `SDB_E_CORRUPT` on any of: magic mismatch, version != 1, size != 32, checksum mismatch, or reserved bytes 28-31 non-zero (`replace.c:68-85`). This error propagates unchanged to `sdb_pager_open` (`pager.c:142-148`), so the DB cannot be opened until the operator manually removes the marker. | DESIGN-DEBT | HIGH | A single flipped bit in the 32-byte marker file — which is not journaled or mirrored the way superblocks are (S.1/S.3) — takes the entire database offline until human intervention. This is disproportionate to the marker's role: it is auxiliary state that recovery could legitimately treat as 'presence of some pending replacement, contents unreadable → abort branch, unlink and retry'. | In `sdb_replace_recover`, treat a decoded-corrupt marker the same as the current abort branch: unlink the marker file, fsync the parent directory, and return SDB_OK so pager_open can continue. Rationale: the caller cannot act on a marker whose replacement_file_id is unreadable anyway, and the safe conservative action (throw away the pending replacement intent) matches what the abort branch already does for file_id mismatch. Optionally log/emit a diagnostic so operators can investigate the corruption source. |
+| A6.4 | `.replace.tmp` files can accumulate across crashes. `sdb_replace_prepare` creates `<db>.replace.tmp` with `sdb_file_create_new` (`replace.c:113`), writes the marker, fsyncs, and then renames to `<db>.replace` (`replace.c:133-135`). If a crash lands after the tmp is created but before the rename, `<db>.replace.tmp` remains on disk. The only cleanup path is same-process (`replace.c:143-145`) — recovery does not sweep `.replace.tmp` orphans. On the next `sdb_replace_prepare` call, line 112 does `sdb_file_remove(temporary_path, true)` before `sdb_file_create_new`, so a same-path retry works — but any `.replace.tmp` files under a destination path that is never revisited stay forever. | DESIGN-DEBT | HIGH | Directory clutter and confusion for operators, plus consumption of disk quota / inodes over time for databases that are backed up to many different destinations. No correctness impact because the tmp files carry only a marker, not user data, and their presence does not affect subsequent recovery (recovery only looks at `<db>.replace`). | Extend `sdb_replace_recover` to also unlink `<db>.replace.tmp` (best-effort, ignore ENOENT) so orphaned tmps are cleaned during recovery regardless of whether the destination is revisited. |
+| A6.5 | `sdb_file_sync_parent_directory` is a no-op on Windows (`file.c:208-219` — returns SDB_OK without any FlushFileBuffers or directory handle open). The Windows replace/backup/compact paths rely entirely on `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (`file.c:225, 244-247`) for durability of the rename metadata. That flag flushes the file's data but Windows documentation only guarantees rename-metadata durability for NTFS in the standard case, and does not extend the guarantee across ReFS or SMB-mounted volumes where MOVEFILE_WRITE_THROUGH may be silently ignored. | DEFENSE-IN-DEPTH | MEDIUM | On non-NTFS or remote-mounted Windows volumes, a power-loss between `sdb_file_replace` returning and the subsequent (no-op) directory sync could leave the rename un-persisted. Recovery would then see the old destination + a marker whose `replacement_file_id` does not match, and take the abort branch — which is safe, but a similar mismatch could arise for the marker install rename itself (`replace.c:133-141`) leaving the destination without a marker and a stale tmp. The one-file-wins invariant depends on the platform honoring MOVEFILE_WRITE_THROUGH. | Document the platform-durability assumption explicitly in PAGER_INVARIANTS.md (which currently only says `FlushFileBuffers` return is honored). Consider opening a directory handle with `FILE_FLAG_BACKUP_SEMANTICS` and calling `FlushFileBuffers` on it after each rename on volumes where MOVEFILE_WRITE_THROUGH is not reliable — Microsoft guidance for durable-rename on non-NTFS filesystems recommends this. At minimum, add a Windows CI matrix job that exercises the compact/backup/replace flows on a ReFS volume and on an SMB share to validate the current assumption. |
+| A6.6 | `sdb_file_replace(source, destination, replace_existing=false)` on POSIX (`file.c:640-651`) uses `link()` + `unlink(source)`. If `link` succeeds but the subsequent `unlink(source)` fails (e.g., due to a directory-permission race, EIO, or read-only filesystem on the source's parent), the function returns `SDB_E_IO` — but the destination has already been atomically installed. The backup caller (`engine.c:2789-2796`) sees the error, keeps `replacement_done=false`, and calls `sdb_replace_abort` at `engine.c:2811` which unlinks only the marker. The destination file has been replaced but the marker is gone. | DESIGN-DEBT | MEDIUM | The user is told 'backup failed' while the destination is silently updated. If a caller retries the backup, `sdb_replace_prepare` succeeds again and installs a fresh marker; the second `sdb_file_replace(temporary, resolved_destination, replace_existing=true)` overwrites the destination with the new (identical) content. So the visible harm is limited to: (a) a misleading error status when the backup actually succeeded, and (b) an orphaned tmp file (cleaned up at `engine.c:2813-2815`). No corruption; not a data-loss path. | On `unlink(source)` failure after a successful `link`, either (a) attempt to remove the just-created destination link and report SDB_E_IO with true rollback semantics, or (b) return SDB_OK (or a distinguished 'installed but cleanup failed' status) since the atomic install actually succeeded and only the source cleanup lingered. Independently, engine.c backup should only call sdb_replace_abort when the destination swap was not observably performed; consider reporting a warning code when the marker/temp cleanup semantics diverge from the actual filesystem state. |
+| A6.7 | FALSE-POSITIVE: The reserved-bytes zero check at `replace.c:81-85` looks redundant given that the marker's CRC covers the entire 32-byte structure with only the checksum field zeroed. A reviewer might argue the CRC alone would catch any modification to bytes 28-31. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A6.8 | FALSE-POSITIVE: One could suspect a rename-vs-fsync race in `sdb_replace_prepare`: the marker's temp file is created, written, and fsynced (`replace.c:113-125`), then renamed over `<db>.replace` (`replace.c:133-135`), and the parent directory is fsynced only at the end (`replace.c:141`). A crash between rename and parent-fsync might leave the destination `<db>.replace` unlinked or reverted on some filesystems, breaking the 'marker file is fully-formed or absent' invariant. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A6.9 | FALSE-POSITIVE: `sdb_replace_recover` runs BEFORE `sdb_wal_recover` in `sdb_pager_open` (`pager.c:142` vs `pager.c:180`). A reviewer might suspect this ordering breaks WAL replay when a marker plus a non-empty WAL are both present at open time. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A6.10 | Compact's error handling violates PAGER_INVARIANTS X.1 ('every entry point that returns non-SDB_OK either leaves the pager unchanged or sets needs_recovery'). If `replaced=true` but any of the post-rename steps fails (directory sync, `sdb_replace_finish`, `sdb_pager_close(&database->pager)`, or the identity-lock swap), `sdb_database_compact_unlocked` hot-swaps the in-memory pager unconditionally (`engine.c:2977-2984`) and does not set `needs_recovery`. The caller receives a non-OK status but the DB handle is silently replaced. | DESIGN-DEBT | HIGH | The caller cannot distinguish 'compact failed, DB is still the old one' from 'compact partially succeeded, DB is now the new one'. In the latter case, callers that inspect the error and skip further operations are safe; callers that log-and-continue may keep writing to a DB whose on-disk state has a stranded marker (A6.1) or a stranded temp WAL/lock at `<path>.tmp-*.wal` (cleaned up at `engine.c:3036-3037` only if control reaches that line without earlier throw). Combined with A6.1, this is the mechanism by which compact-time errors become data-loss. | After a successful `sdb_file_replace` when any subsequent post-rename step returns non-OK, set `database->pager.needs_recovery = true` (on the newly-installed pager) before returning. This makes the pager reject further reads/writes at `pager.c:393/427/488/581/660/726`, forcing the caller to close and reopen — at which point recovery will observe and resolve any stranded `.replace` marker (A6.1) or WAL/lock sidecar. Add an explicit note in docs/PAGER_INVARIANTS.md X.1 that database-level entry points that manipulate the pager (compact, backup) are also bound by the invariant. |
+
+**Summary A6**: Ten findings after adversarial verification: zero CONFIRMED-BUGs, one LIKELY-BUG (A6.1 — stranded compact marker can silently delete a live WAL on the next open, producing durability loss for committed-but-uncheckpointed transactions), four DESIGN-DEBT items (A6.3 corrupt marker bricks the DB, A6.4 `.replace.tmp` orphans, A6.6 non-atomic POSIX link+unlink misreports success, A6.10 compact violates the X.1 needs_recovery invariant and amplifies A6.1), two DEFENSE-IN-DEPTH items (A6.2 ENOENT vs. IO conflation, A6.5 Windows dir-sync no-op depends on MOVEFILE_WRITE_THROUGH honoring), and three FALSE-POSITIVEs (A6.7, A6.8, A6.9). Overall assessment: the replace/backup/compact protocol is fundamentally sound — the atomic-rename and marker-then-swap invariants hold — but the compact hot-swap couples A6.1 with A6.10 into a real (if narrow) silent-data-loss window, and the marker-error handling (A6.2, A6.3) is more brittle than the rest of the storage stack. Fixing A6.1 and A6.10 together is the priority; the remaining items are hardening.
+
+---
+
+## A7. File I/O portability (`src/file.c, src/windows_path.c`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A7.1 | On Windows sdb_file_sync_parent_directory is a no-op that unconditionally returns SDB_OK, so W.9 (parent-directory fsync at WAL creation) and the directory-durability step that replace.c performs after every atomic-swap step are silently skipped. | DESIGN-DEBT | HIGH | A crash after sdb_file_replace succeeds on Windows can leave the directory entry (WAL, .replace marker, backup destination) unpersisted even though the file body was flushed by MOVEFILE_WRITE_THROUGH / FlushFileBuffers. In corner cases the newly-swapped file can appear to not exist after reboot, or a WAL created but never written can vanish before recovery - violating the invariant the POSIX branch upholds. | Implement a real Windows directory sync using CreateFileW on the parent directory with FILE_FLAG_BACKUP_SEMANTICS followed by FlushFileBuffers; if backup privileges are unavailable, at minimum document the residual crash window in PAGER_INVARIANTS.md W.9 and note which Windows FS metadata-journaling modes provide the missing guarantee, and add a Windows-only recovery step that re-verifies directory-entry presence for .wal and .replace markers. |
+| A7.2 | sdb_file_sync uses fsync(2) on both Linux and macOS. On macOS fsync only flushes the kernel buffer to the drive - it does not wait for the drive to flush its own cache to media; F_FULLFSYNC is required for that. PAGER_INVARIANTS.md claims 'fsync return' is a power-loss durability barrier, which does not hold on Apple hardware. | LIKELY-BUG | MEDIUM | On a power failure or hard reset of a macOS host, the last WAL commit trailer or the last superblock mirror update can be lost even though sdb_txn_commit and sdb_superblock_store_update_file returned SDB_OK. T.7 (post-commit atomicity) and S.1 (mirrored-slot survival) therefore only hold against process crashes, not against power loss, on macOS. | On Apple targets, replace fsync(fd) in sdb_file_sync with fcntl(fd, F_FULLFSYNC) (falling back to fsync on EINVAL for filesystems that do not support it), or expose a build-time option that lets the caller opt in. Update PAGER_INVARIANTS.md to state that the durability barrier is 'fsync on Linux, F_FULLFSYNC on macOS, FlushFileBuffers on Windows', and note the fallback behavior when F_FULLFSYNC is unsupported. |
+| A7.3 | sdb_file_replace on Windows uses MoveFileExW(MOVEFILE_WRITE_THROUGH [\| MOVEFILE_REPLACE_EXISTING]) without MOVEFILE_COPY_ALLOWED. This is atomic on NTFS/ReFS same-volume (the supported deployment target), but MoveFileEx REPLACE_EXISTING is not formally atomic on FAT32/exFAT and depends on server semantics over SMB. MOVEFILE_WRITE_THROUGH is also a no-op without MOVEFILE_COPY_ALLOWED per MSDN — cosmetic dead flag. | DESIGN-DEBT | LOW | On FAT32/exFAT destinations, a crash inside the MoveFileEx REPLACE_EXISTING window can leave the destination path missing with the .replace marker present and the .tmp source still on disk. Recovery cannot reconstruct the destination — the caller sees an open failure rather than automatic recovery — so the 'main path always names old or new image' guarantee in docs/OPERATIONS.md is a same-volume-NTFS guarantee in practice. Cross-volume moves fail cleanly (no COPY_ALLOWED), so that path does not tear. | Prefer ReplaceFileW (or NtSetInformationFile with FileRenameInformationEx + FILE_RENAME_POSIX_SEMANTICS on Win10+) for the swap on Windows so REPLACE_EXISTING is atomic across all supported filesystems, drop the misleading MOVEFILE_WRITE_THROUGH flag, and document that non-NTFS/ReFS deployments (FAT32/exFAT/certain SMB servers) are not covered by the atomic-replace contract. |
+| A7.4 | On POSIX with replace_existing == false, sdb_file_replace calls link(source, destination) and then unlink(source). If link succeeds but unlink fails, the function returns SDB_E_IO while destination and source both exist on disk. A subsequent retry by the caller will hit EEXIST from link, so the caller can never recover the intended 'atomic move' semantics without out-of-band cleanup. | DESIGN-DEBT | HIGH | A hardlinked stray source file can persist forever alongside the successfully-created destination. In backup/compact flows this leaks a fully-populated database file at the temp path - which is doubly bad because the temp path is inside the target directory and its stale content is indistinguishable from a fresh backup on the next run. | On unlink(source) failure after a successful link(), attempt a bounded number of unlink retries and, if still failing, either (a) unlink(destination) to roll back and return SDB_E_IO so retry is safe, or (b) return a distinct status (e.g. SDB_E_PARTIAL) that documents the stray-source state so callers can invoke sdb_file_remove(source, true) as recovery. Document the guarantee in the header. |
+| A7.5 | FALSE-POSITIVE: Both branches of sdb_file_replace on POSIX (rename for replace, link+unlink for create) fail with EXDEV when source and destination are on different filesystems, and neither path falls back. Callers get SDB_E_IO with no hint about the cause. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A7.6 | sdb_windows_path_from_utf8 unconditionally passes the caller's path to CreateFileW / DeleteFileW / MoveFileExW without prepending the '\\\\?\\' extended-length prefix. On stock Windows without the Win10 1607 long-path manifest, paths longer than MAX_PATH (260 chars) fail immediately. | DESIGN-DEBT | HIGH | Databases living under long user directories (roaming profiles, deeply-nested CI workspaces, OneDrive-synced paths) will fail to open with SDB_E_IO even when the underlying filesystem supports the path. The failure mode is silent - no hint that MAX_PATH was the limit. | In sdb_windows_path_from_utf8, after converting to UTF-16, canonicalize the path via GetFullPathNameW and — when the resulting length exceeds MAX_PATH — prepend '\\\\?\\' (or '\\\\?\\UNC\\' for '\\\\server\\share' paths). Alternatively, ship a longPathAware manifest and document the Win10 1607 requirement in the build docs. Either way, surface a distinct error (e.g. SDB_E_PATH_TOO_LONG) so callers can tell path-length failures apart from generic I/O errors. |
+| A7.7 | sdb_file_should_fail_for_testing is compiled unconditionally into release builds and is invoked on every read/write/sync/resize/size call. sdb_file_set_io_limit_for_testing and sdb_file_fail_after_for_testing are non-static and reachable through the internal header; they are not guarded by any SDB_TESTING macro. | DESIGN-DEBT | HIGH | Two costs. (a) Perf: every I/O boundary pays a load, compare and branch for a feature no production caller uses. (b) Correctness: an internal API break that leaks the test symbols to an out-of-tree caller could make the pager deterministically fail its own I/O and set needs_recovery. The symbol table also documents to a security auditor that arbitrary I/O failures are injectable from within the library. | Guard sdb_file_should_fail_for_testing, the three test-mutator functions, and the io_limit/test_operation_count/test_fail_after struct members behind an #ifdef SDB_TESTING (or equivalent build option). Ensure release builds compile with the injection call sites removed so the hot path drops the load/compare/branch and the test symbols never enter the public library's symbol table. |
+| A7.8 | FALSE-POSITIVE: sdb_windows_path_from_utf8 uses MultiByteToWideChar with a strlen('-1')-driven size and MB_ERR_INVALID_CHARS. Non-UTF-8 bytes are rejected with SDB_E_INVALID_ARGUMENT, and the second conversion re-runs with the same flags into a buffer that was pre-sized off the first call - a pattern that is safe against concurrent modifications only because path is a caller-owned C string. | FALSE-POSITIVE | HIGH | None. The wide_size returned by the sizing call already includes room for the terminating NUL because we pass -1 as the source length; the equality check against wide_size on the second call catches any inconsistency. Overflow of the malloc size is checked at line 22-24. | — |
+| A7.9 | FALSE-POSITIVE: sdb_file_close on POSIX deliberately does not retry close on EINTR. On Linux (and per POSIX 2016) the descriptor is released even when close returns EINTR, so retrying can close an unrelated descriptor a concurrent thread just opened. | FALSE-POSITIVE | HIGH | None; this is the correct Linux and POSIX behaviour and is documented in-code (`src/file.c:441-448`). | — |
+| A7.10 | FALSE-POSITIVE: sdb_file_resize on Windows performs SetFilePointerEx followed by SetEndOfFile - two distinct syscalls. If the first succeeds but the second fails, the file pointer has moved but the size has not. | FALSE-POSITIVE | HIGH | None for this codebase. Every read and write uses OVERLAPPED with an explicit per-call Offset/OffsetHigh (`src/file.c:114-115, 149-150`), so the shared file pointer is never consulted for correctness. The only observable effect of a failed SetEndOfFile is that sdb_file_resize returns SDB_E_IO, which the caller (sdb_pager_canonicalize_file_size and sdb_pager_allocate) treats as a failed operation and does not commit the corresponding superblock advance. | — |
+| A7.11 | Windows sdb_file_open_windows uses FILE_SHARE_READ \| FILE_SHARE_DELETE and omits FILE_SHARE_WRITE. This intentionally blocks a second writer, and it also lets a peer process rename/delete the file out from under our open handle - which is exactly the behaviour sdb_file_replace needs on Windows. | DEFENSE-IN-DEPTH | HIGH | A hostile or buggy peer with write access to the directory can DeleteFileW the open database; the handle keeps working (Windows delete-on-close semantics) but subsequent operations that reopen by name will fail. This is the standard Windows atomic-replace tradeoff and is not a bug against the current contract. | Document the Windows share-mode tradeoff in a comment near CreateFileW and/or in porting notes: FILE_SHARE_DELETE is required to allow sdb_file_replace's rename-based atomic swap, and the cost is that a hostile peer with directory write access could unlink the open file. No code change needed unless the threat model changes. |
+| A7.12 | sdb_file_resolve_database_path on POSIX with must_exist=false rejects trailing '/', '.' and '..' as the leaf name (`src/file.c:698, 720-724`) but sdb_file_sync_parent_directory itself does not - a caller that passes 'foo/' would sync 'foo' as the parent directory instead of '.'. | DEFENSE-IN-DEPTH | HIGH | None today: every path that reaches sdb_file_sync_parent_directory has already been produced by sdb_file_resolve_database_path or by sdb_pager_make_wal_path, which append a fixed suffix without a trailing slash. Only an unvalidated caller could observe the wrong directory being fsynced, and that caller would already have violated the layering contract. | Add a defensive precondition check in sdb_file_sync_parent_directory that mirrors sdb_file_resolve_database_path: reject paths with a trailing '/' (or normalize the parent lookup to strip trailing slashes before strrchr). This makes the function safe against future callers that bypass the resolver. |
+
+**Summary A7**: Twelve findings covered the file-I/O portability layer: zero CONFIRMED-BUGs, one LIKELY-BUG (A7.2 — macOS fsync is not a true power-loss barrier without F_FULLFSYNC, weakening T.7 and S.1 on Apple hosts under actual power loss), five DESIGN-DEBT items (A7.1 Windows parent-directory fsync no-op, A7.3 MoveFileExW atomicity gap on non-NTFS filesystems, A7.4 unrecoverable link+unlink stray on POSIX, A7.6 missing long-path prefixing on Windows, A7.7 unconditional test-hook cost and public surface area), two DEFENSE-IN-DEPTH observations (A7.11 Windows share-mode tradeoff, A7.12 missing trailing-slash guard on sdb_file_sync_parent_directory), and four FALSE-POSITIVEs (A7.5 EXDEV unreachable via current callers, A7.8 MultiByteToWideChar pattern is correct, A7.9 EINTR-close policy is intentional and correct, A7.10 SetEndOfFile file-pointer side-effect is harmless because all I/O uses OVERLAPPED). The single durability-relevant defect (A7.2) is scoped to macOS+power-loss and should be closed by adopting F_FULLFSYNC; the remaining design-debt items are portability and diagnostic sharpening that do not threaten the crash-safety contract on the primary Linux/NTFS deployment.
+
+**Remediation update (2026-08-02):** The table above is the immutable audit
+record, not current status. A7.1/A6.5 now open and flush the Windows parent
+directory with documented unsupported-filesystem fallback; A7.2 uses
+`F_FULLFSYNC` for both files and parent directories on Apple targets; A7.3 uses
+`ReplaceFileW`; A7.4 rolls the destination back if unlinking the source fails;
+A7.6 prefixes absolute drive/UNC paths and has an end-to-end >260-character DB
+test; A7.7 is compiled out when `SDB_TESTING=OFF`; and A7.12 rejects trailing
+separators. Windows file-identity exclusion was also changed from a mandatory
+whole-file lock to a named semaphore and exercised by the 48-test MinGW/Wine
+suite. Native signed candidate evidence remains an external release gate.
+
+---
+
+## A8. Page cache / concurrency (`src/page_cache.c, src/sync.c`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A8.1 | `sdb_page_cache_put` can leave two valid entries with the same `page_id` when a lower-index slot has previously been invalidated via `sdb_page_cache_remove`. | DEFENSE-IN-DEPTH | HIGH | With the cache full, if `sdb_pager_read(Px)` fails decode/decrypt and calls `sdb_page_cache_remove` (`page_cache.c:100-106` clears `.valid` but keeps `.page_id`), a later put of another cached page `Py` whose real slot is > k breaks at the invalid slot k first (`page_cache.c:74-87`), inserting a duplicate at k while the original stays valid at slot > k. Currently absorbed by adjacent invariants (first-match get, LRU eviction of the older-stamp copy), so no stale read is observable in-tree; a future change (non-first-match get, non-monotonic clock, or back-to-back invalidation on the same id) would surface stale bytes. | In `sdb_page_cache_put`, always scan the full array for an existing valid entry with the same `page_id` before choosing an invalid or LRU victim (two-pass loop: page_id match first, invalid-else-LRU second). Optionally clear `.page_id` in `sdb_page_cache_remove` so a stale id cannot be keyed off. |
+| A8.2 | `sdb_database_close` reads `database->open` without holding `database->mutex`, so any concurrent close+op call can race into a `mutex_lock` on an already-destroyed mutex and a use-after-free on the freed struct. | DESIGN-DEBT | HIGH | Thread A: `sdb_database_close` reads `database->open==true` at `engine.c:1064`, locks mutex, flips open=false, unlocks, destroys mutex, frees database (`engine.c:1078-1081`). Thread B: `SDB_ENGINE_LOCK_OR_RETURN` reads `database->open` before locking (`engine.c:3055-3058`); if B observes open==true before A's flip but calls `sdb_mutex_lock` after A's destroy/free, B locks a destroyed mutex on freed memory — UB. `docs/CONCURRENCY.md` puts this on the caller (close is an ownership boundary), but no code-level defense exists. | Either (a) add a debug-only guard — an atomic in-flight-op counter checked in close and aborting on nonzero — so misuse is caught deterministically instead of silently corrupting memory, or (b) introduce a per-handle refcount/rwlock so close drains outstanding ops before destroying the mutex. Option (a) is a low-cost hardening matching the coarse-lock model already in use. |
+| A8.3 | `sdb_database_close` calls `sdb_mutex_unlock` immediately followed by `sdb_mutex_destroy`; any thread parked on that mutex at unlock time races against `pthread_mutex_destroy`, which is UB with waiters. | DEFENSE-IN-DEPTH | MEDIUM | If a caller violates the docs invariant and has another thread already blocked in `sdb_mutex_lock(&database->mutex)` when close runs, `pthread_mutex_unlock` releases exactly one waiter. Scheduled before destroy the destroy fails EBUSY and `sdb_sync_abort` terminates the process (`sync.c:250-253`); scheduled after, it operates on destroyed pthread state — UB. Under the documented caller-serialize invariant (`CONCURRENCY.md:16-17`) unreachable, so defense-in-depth only. | Keep the caller-serialize documented invariant. Optionally harden by returning `SDB_E_BUSY` (or asserting) if a concurrent lock attempt is detectable, or by dropping the destroy entirely and leaking the mutex (safe with per-database lifetime). Not required under current contract. |
+| A8.4 | `sdb_process_lock_acquire` on POSIX opens the `<db>.lock` sidecar without `O_NOFOLLOW`, so a symlink planted at that path is followed. | DEFENSE-IN-DEPTH | HIGH | In a shared directory an attacker with write access can create `<db>.lock` as a symlink to another file. Consequences: (a) DoS — `LOCK_EX` flock held on the wrong inode, so the true `.lock` remains unlocked and a second process can acquire our database; (b) collateral — we hold flock on some third-party file until close; (c) stealth-create — with `O_CREAT`, a 0600 file is created at an attacker-chosen path owned by the shibadb user. Deployment model (single trust domain, `docs/CONCURRENCY.md`) mitigates the impact. Windows path is unaffected. | Add `O_NOFOLLOW` to the POSIX `open()` in `sdb_process_lock_acquire` (mirror in `sdb_process_lock_acquire_database`) so a pre-planted symlink fails ELOOP instead of being silently followed. Optionally follow up with an `fstat`/`lstat` inode-identity check to refuse hardlink swaps. Preserve `O_CREAT | O_CLOEXEC | 0600`. |
+| A8.5 | `sdb_page_cache_get`/`_remove` miss paths and `sdb_page_cache_put`'s full-cache-eviction path each perform a linear O(N) scan of the entry array; only the hit paths short-circuit early. | DESIGN-DEBT | HIGH | At N=`SDB_PAGER_CACHE_CAPACITY`=64 (`pager.h:10`) the cost is bounded — a miss in get/remove walks all 64 entries, and a put that must evict scans all 64 to pick the minimum-stamp victim (`page_cache.c:84`). Hits do short-circuit. Bumping capacity to a realistic working set (e.g. 4096 pages) turns every cache miss and every eviction into a 4096-entry scan. Not a correctness issue today; a hard blocker for tuning cache size upward. | Before raising `SDB_PAGER_CACHE_CAPACITY`, replace the flat array with (a) a hash table keyed by `page_id` for O(1) lookup and (b) an intrusive doubly-linked LRU list for O(1) eviction. Keep the current array-plus-stamp scheme only while N stays at ~64. |
+| A8.6 | The page-cache API accepts a bare `uint8_t*` for both `page` and `page_out` with no length argument; every caller is required to pass exactly `page_size` bytes and there is no in-function guard. | DESIGN-DEBT | MEDIUM | `sdb_page_cache_get` unconditionally memcpys `cache->page_size` bytes into `page_out` (`page_cache.c:56-58`); `sdb_page_cache_put` unconditionally memcpys `cache->page_size` bytes out of `page` (`page_cache.c:91`). In-tree callers (`pager.c:472, 500, 515, 525-571, 1037-1041`) all pass buffers validated at pager entry (`pager.c:493`), so nothing is broken today. A future caller — for instance a compact/backup path in `engine.c` — that forgets the size contract will corrupt heap or read out-of-bounds without any warning. | Add explicit `size_t page_out_size`/`size_t page_size` parameters to `sdb_page_cache_get`/`_put` and return `SDB_E_BUFFER_TOO_SMALL` (or assert) when the caller's buffer is smaller than `cache->page_size`. Alternatively, document the size contract in `page_cache.h` referencing the invariant that all buffers must be exactly `cache->page_size` bytes. |
+| A8.7 | FALSE-POSITIVE: `sdb_pager_read` caches the encrypted page image at `pager.c:515` before verifying `view_out->type == SDB_PAGE_TYPE_ENCRYPTED` at line 524; on mismatch it evicts at line 525 or 529. | FALSE-POSITIVE | HIGH | Under the coarse engine mutex (`docs/CONCURRENCY.md`) no other thread can observe the cache between line 515 and the remove at 525/529, so the brief presence of a not-yet-validated page is invisible. Even if it were observed, C.2 ('cache hit does not skip decode') means the next reader would rerun the same failing decode/decrypt path and reach the same remove, so persistence of a poisoned entry is not possible. | No change required. Optionally, move the `sdb_page_cache_put` call to after all validation completes to make the invariant locally obvious to readers of `pager.c`, eliminating reliance on the mutex + always-decode combination for correctness reasoning. |
+| A8.8 | FALSE-POSITIVE: `sync.c` exports no condition-variable primitives; concerns about condvar signaling races are inapplicable to this subsystem. | FALSE-POSITIVE | HIGH | The engine uses one recursive `sdb_mutex` per database handle (`engine.c:43`, `docs/CONCURRENCY.md:6-21`) and no `pthread_cond_*` / `SleepConditionVariableCS` at any callsite. All coordination between threads is either 'call under the mutex' or 'caller must join before close'. So there is no signal/wait race surface to audit here. | — |
+| A8.9 | FALSE-POSITIVE: `sdb_pager_rotate_password` rewraps the same data key with a new password but leaves the actual data key unchanged; on-disk and in-cache encrypted page bytes stay valid, so no cache invalidation is needed. | FALSE-POSITIVE | HIGH | A naive reviewer might flag the absence of a `sdb_page_cache_destroy(&pager->cache)` or blanket eviction inside `sdb_pager_rotate_password` (`pager.c:400-412`). Because rotate only touches `key_wrap_id`, `kdf_iterations`, and the wrapped-key bytes (superblock fields authenticated by S.8 / E.6), the AEAD data key that ciphered every cached page is byte-identical after rotation. Every cached encrypted page continues to decrypt correctly. | No action required. Optional: add a code comment at `pager.c:400` noting that rotate is deliberately cache-safe because the data key is unchanged, to preempt future reviewers proposing an unnecessary cache flush. |
+| A8.10 | FALSE-POSITIVE: `sdb_page_cache_init` leaves `capacity=0` on failure and `sdb_page_cache_put` guards `cache->capacity == 0U` before writing, so a failed init cannot cause a null-deref in later cache calls. | FALSE-POSITIVE | HIGH | A reviewer might worry that `sdb_page_cache_destroy` called from the init failure path (`page_cache.c:24`) leaves `.entries` and `.storage` as NULL while capacity/page_size are 0 (from the leading memset). `sdb_page_cache_put` explicitly rejects `capacity==0` at `page_cache.c:71-73`, and `sdb_page_cache_get`/`_remove` iterate `index < cache->capacity` so their loops run zero times when capacity is 0. Every access post-failure degrades to a no-op instead of crashing. | No change required. The layered defense (destroy zeroes capacity + put/get/remove guard on capacity) makes failed-init safe. |
+| A8.11 | FALSE-POSITIVE: POSIX `sdb_process_lock_release` returns `SDB_E_IO` if `flock(LOCK_UN)` fails even though the subsequent `close(fd)` inherently releases the advisory lock. | FALSE-POSITIVE | HIGH | Callers might interpret the `SDB_E_IO` as 'lock was not released' and try to retry (`sdb_process_lock_release` is invoked in the close paths of `engine.c` at 946, 1012, 1043, 1075-1076). In practice `LOCK_UN` failing after `LOCK_EX` held on a valid fd cannot leave the fd flocked because `close()` drops all locks associated with the file description. Even a retry would fail the `!lock->held` guard with `SDB_E_INVALID_ARGUMENT`. The only observable effect is a distinguishable status; correctness is preserved. | Optionally treat a `LOCK_UN` failure as non-fatal (return `SDB_OK` when `close()` succeeded), or document the semantics so callers do not attempt to retry. |
+| A8.12 | FALSE-POSITIVE: The `clock` counter that stamps LRU ordering is a `uint64_t` incremented once per get/put, so overflow cannot occur within any realistic database lifetime. | FALSE-POSITIVE | HIGH | A skeptic might ask whether `cache->clock` wrapping could invert LRU ordering. `clock` is bumped at `page_cache.c:55` and `page_cache.c:89` by 1 per call. At even 10^9 cache ops/sec (three orders of magnitude beyond what a page-cache-limited engine can sustain), overflow of 2^64 would take ~584 years. Not reachable. | — |
+
+**Summary A8**: Zero CONFIRMED-BUG and zero LIKELY-BUG items — every finding either sits behind a documented caller contract or is absorbed by an adjacent invariant. Three DESIGN-DEBT items are the actionable core: A8.2 (unsynchronized `database->open` TOCTOU that turns concurrent close+op into a use-after-free), A8.5 (linear O(N) miss/eviction scans that block raising cache capacity), and A8.6 (unchecked buffer length in the page-cache API). Three DEFENSE-IN-DEPTH items — A8.1 (duplicate valid cache entries after invalidate + put), A8.3 (`mutex_destroy` racing waiters immediately after `mutex_unlock`), and A8.4 (missing `O_NOFOLLOW` on the `.lock` sidecar) — are latent hazards worth hardening even though current invariants absorb them. The remaining six (A8.7–A8.12) are FALSE-POSITIVES verified against the code and documented invariants. Overall assessment: this subsystem is correct under its documented single-writer, caller-serializes-close model, but leans heavily on that model; A8.2 in particular deserves a cheap in-code guard rather than a docs-only contract.
+
+---
+
+## A9. Public API / error cleanup (`src/engine.c public entry points`)
+
+| # | Finding | Severity | Conf. | Consequence | Recommended action |
+|---|---|---|---|---|---|
+| A9.1 | Public maintenance entry points `sdb_database_compact` and `sdb_database_migrate` (`engine.c:3088-3119`) never check `database->active_transaction`, unlike every mutating handle API (`sdb_kv_put`/`_delete`, `sdb_blob_*`, `sdb_document_*`, `sdb_index_create` at `engine.c:3594-3806`) which rejects with `SDB_E_BUSY`. `sdb_database_compact_unlocked` (`engine.c:2870-2873`) proceeds unconditionally; on the success path it calls `sdb_pager_close(&database->pager)` (`engine.c:2976`), which returns `SDB_E_INVALID_ARGUMENT` while `pager->transaction_active` (`pager.c:350-355`) without closing the fd, destroying the cache, or freeing `wal_path` — then unconditionally overwrites `database->pager` and `database->tree` with `target->pager`/`target->tree` (`engine.c:2980-2984`). The user's outstanding `sdb_transaction` still holds an `sdb_btree_batch` whose embedded `sdb_txn.pager` points at `&database->pager` (`btree.c:926-943`, `pager.c:724-737`), which now belongs to a fresh, txn-inactive pager. `sdb_database_verify` and `sdb_database_backup` do not exhibit this bug — they never replace the pager and only read the committed snapshot. | LIKELY-BUG | HIGH | Single-thread sequence `sdb_transaction_begin` -> stage `sdb_transaction_kv_put` -> `sdb_database_compact` (or `sdb_database_migrate`) leaks the old pager's file descriptor and cache heap allocations plus the old `wal_path` buffer. The on-disk file is already swapped for the compacted image, and the caller's still-live `sdb_transaction` is orphaned: its `batch->txn.pager` address now targets a fresh pager with `transaction_active == false`, and the staged `txn->pages` reference page IDs from the pre-compact tree. A subsequent `sdb_transaction_commit` either fails with a confusing status or, worse, writes stale-referenced pages into the new file. The T.1/T.5 pager invariants (`transaction_active` must be set on the pager that owns the batch) are violated. The compact call itself does return `SDB_E_INVALID_ARGUMENT` to the caller (`engine.c:3013-3018` propagates `close_status`), contrary to the original finding — but the corruption is already done by that point and the error is easy to misinterpret as a benign no-op failure. | In `sdb_database_compact_unlocked` (before line 2874) add: `if (database->active_transaction != NULL) return SDB_E_BUSY;` mirroring the guard used in `sdb_kv_put`/`sdb_blob_put`/etc. This also covers `sdb_database_migrate`, which routes through the same helper. Optionally document in `OPERATIONS.md` that compact/migrate require no live `sdb_transaction`. Verify/backup can keep their current behaviour (they are safe against an open txn). |
+| A9.2 | FALSE-POSITIVE: Inside `sdb_database_compact_unlocked` on the `replaced` branch (`engine.c:2975-2984`), `sdb_pager_close(&database->pager)` is called and its return value is captured into `close_status`, but the subsequent statements `database->pager = target->pager; (void)memset(&target->pager, 0, sizeof(target->pager)); database->tree = target->tree;` run unconditionally. `close_status` is only folded into the returned status much later at `engine.c:3017`. So even when close fails (e.g. `SDB_E_INVALID_ARGUMENT` because `transaction_active` per `pager.c:353`, or `SDB_E_IO` from a final fsync), the pager struct is clobbered and its file descriptor, WAL handle and page-cache allocations become unreachable. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A9.3 | `sdb_transaction_close` (`engine.c:3229-3239`) rejects an active transaction with `SDB_E_BUSY` without freeing the handle, and — critically — without clearing `database->active_transaction`. Combined with `sdb_database_close`'s guard at `engine.c:1068-1072` (which refuses to close if `active_transaction != NULL`) a caller who forgets to `sdb_transaction_rollback` and only calls close ends up unable to close either the transaction or the database. The path lock and process lock are still held, so the DB cannot even be reopened in the same process. | DESIGN-DEBT | HIGH | Trivial user footgun (`begin_txn` -> forget to commit/rollback -> `sdb_transaction_close` -> `sdb_database_close`) leaves the database handle wedged and process locks held for the rest of the process lifetime. Not a corruption but a durable resource leak that's easy to hit in bindings / test harnesses that use RAII on the txn handle. | Make `sdb_transaction_close` implicitly rollback (call `sdb_engine_mutation_abort`, clear `database->active_transaction` under the mutex, then free the transaction) rather than returning `SDB_E_BUSY`. Alternatively, document loudly that close is only valid after commit/rollback and have it return `SDB_E_BUSY` but still free/detach — but the RAII-friendly implicit-rollback path is what most C APIs converge on and eliminates the wedge entirely. |
+| A9.4 | `SDB_ENGINE_LOCK_OR_RETURN` (`engine.c:3053-3059`) reads `database->open` before taking `database->mutex`. `sdb_database_close` writes `open = false` at `engine.c:1074`, unlocks at 1077, then destroys the mutex at 1078 and frees `database` at 1081. A thread that sampled `open == true` in the macro and then blocked in `sdb_mutex_lock` will wake to a destroyed mutex and freed struct — use-after-free. | DEFENSE-IN-DEPTH | HIGH | Under the documented contract 'no concurrent close vs op' the path is safe. If a caller violates it (a common footgun in language bindings that expose independent thread references to the same handle), the result is UAF, not a clean `SDB_E_INVALID_ARGUMENT`. The `!database->open` check gives the false impression that concurrent close is defended against. | Either (a) document loudly at the API boundary that concurrent close vs any other op is UB and remove the `!open` fast-path so callers don't mistake it for a guard, or (b) add real lifecycle protection: a global registry mutex or refcount that keeps the handle (and its mutex) alive until all in-flight ops drain, so `close` cannot free the struct while another thread is blocked on the handle's mutex. |
+| A9.5 | FALSE-POSITIVE: `sdb_database_open` at `engine.c:1030-1034` uses the branch `status = options->password_size == 0U ? sdb_pager_open(...) : SDB_E_INVALID_ARGUMENT;` to reject 'unencrypted database opened with a non-empty password'. Symmetrically, opening an encrypted DB with `password_size == 0` goes through `sdb_pager_open_encrypted` which will surface `SDB_E_AUTHENTICATION` via `key_manager.c:114-121` (R.1). The error codes for the two closely related misuses diverge in a way that is likely to confuse callers. | FALSE-POSITIVE | HIGH | None — refuted, see reasoning | — |
+| A9.6 | `sdb_database_backup_unlocked` computes `sdb_verify_result verify_result` (`engine.c:2685`), populates it via `sdb_database_verify_unlocked` at `engine.c:2725`, then discards it with `(void)verify_result;` at `engine.c:2830` and never writes it into `result_out`. The `sdb_backup_result` struct only receives `byte_count` (`engine.c:2827`). Callers who wanted the same 'entries verified during backup' summary that compact does report (`engine.c:3023-3024`) have no way to get it. | DESIGN-DEBT | HIGH | Verify still runs on the backup path (cost is paid) but the result is thrown away, so backup log / UI cannot surface it. Not a defect against the current contract, but the vestigial `(void)verify_result` reads like a partially-implemented feature. | Either (a) surface the verify counts into one of the reserved slots of `sdb_backup_result` (mirroring the compact path — the ABI has `reserved[4]` headroom and `sizeof == 40` is asserted, so a rename of one reserved slot to e.g. `raw_entry_count` is source-compatible), or (b) drop the `verify_result` out-parameter entirely and call an internal verify variant that only returns status, so the pre-backup integrity gate remains but the dead struct and `(void)` cast disappear. |
+| A9.7 | FALSE-POSITIVE: `sdb_transaction_commit` (`engine.c:3195-3210`) clears `database->active_transaction`, `transaction->active`, and `transaction->database` unconditionally after `sdb_engine_mutation_commit` returns — even when commit failed and set `pager->needs_recovery` (T.5). This is deliberate: the batch's `failure` poisoning at `btree.c:1084, 1204` guarantees `sdb_btree_batch_commit` aborts the batch on any recorded per-op failure, so no partial commit can slip through even if intermediate `sdb_transaction_kv_put` calls returned an error but the caller went ahead and issued commit. | FALSE-POSITIVE | HIGH | None. What looks superficially like a bug ('mid-txn errors could half-commit') is prevented by the btree layer. | — |
+| A9.8 | FALSE-POSITIVE: `sdb_transaction_reserve` (`engine.c:3143-3156`) increments `operation_count` and `logical_byte_count` before the underlying `sdb_object_put`/`sdb_object_delete` runs; on failure of that inner call the counters are not decremented. Under adversarial usage the counters would inflate and eventually the transaction would return `SDB_E_OVERFLOW` even for a valid new op. | FALSE-POSITIVE | MEDIUM | None in practice: any inner failure sets `batch->failure` (`btree.c:1084/1110/1124/1139/1169/1185`) and every subsequent batch op returns immediately per `btree.c:955/1097`, so the caller cannot slip a new op past the poisoned batch anyway; commit will surface the recorded error. Counter inflation is bounded by `SDB_TRANSACTION_MAX_OPERATIONS` and only matters to a caller ignoring per-op errors — such a caller is already broken. | — |
+| A9.9 | FALSE-POSITIVE: The create-path cleanup at `engine.c:900-905` runs `sdb_mutex_destroy(&database->mutex)` and `sdb_database_clear_password(database)` even if the failure was in `sdb_database_store_password` (before `sdb_mutex_init` ever ran). `sdb_mutex_destroy` is idempotent thanks to the `initialized` guard at `sync.c:69-75, 247-256` and `database` was `calloc`'d at `engine.c:883`, so `initialized == false` and the destroy is a no-op. Likewise `sdb_database_clear_password` calls `free(NULL)` (safe) on the un-set password field. | FALSE-POSITIVE | HIGH | None. The 'always run cleanup' style is safe here specifically because `sdb_mutex_init` on POSIX sets `initialized = false` at `sync.c:214` before the internal pthread call, and `calloc` zeros the destination before that. | — |
+| A9.10 | FALSE-POSITIVE: `sdb_status_string` (`status.c:13-47`) enumerates every currently-defined `sdb_status` and falls through to `"unknown status"` for anything else. Every enumerator in `shibadb.h`'s `sdb_status` (`SDB_OK`..`SDB_E_BUSY`) is covered by a case; the default guards ABI extension. | FALSE-POSITIVE | HIGH | None. | — |
+| A9.11 | `sdb_database_close` (`engine.c:1073-1085`) returns `pager_close` status in preference to lock release statuses. If `sdb_pager_close` fails (e.g. final `fsync` returns `EIO`), `lock_status` and `path_lock_status` are computed but discarded whenever the pager error is non-OK. The database handle is always freed regardless of which error was seen. | DEFENSE-IN-DEPTH | HIGH | A lock-release failure (e.g. flock returning EIO) can be masked by a same-call pager fsync failure. In practice both indicate a broken filesystem and any error at all should make the caller reopen, so the loss is cosmetic. Freeing the handle even when close fails is also intentional — retrying close after a hard fsync failure has no path forward. | Consider logging or aggregating both statuses (e.g. prefer the first non-OK status but record the rest via a diagnostic hook) so operators can distinguish a pager fsync failure from a lock release failure during postmortems. Cosmetic; no correctness change required. |
+| A9.12 | `sdb_transaction_lock` (`engine.c:3121-3141`) reads `transaction->active`, `transaction->database`, and `database->active_transaction` under the database mutex — protecting the txn-vs-close ordering — but the initial `transaction != NULL \|\| !transaction->active \|\| transaction->database == NULL` sanity check at 3126-3127 reads those fields BEFORE any lock. If a second thread is concurrently in `sdb_transaction_commit`/`rollback` (which write `transaction->active`/`transaction->database` at 3206-3207, 3223-3224 while holding the database mutex), the pre-lock read is a data race per the C11 memory model. | DEFENSE-IN-DEPTH | MEDIUM | Under the documented single-owner-per-txn contract this cannot fire — a well-behaved caller never touches the same txn from two threads. If it happens (e.g. a cancel button in a UI wired to rollback), the race is between a torn read of a bool/pointer and a value written under a different mutex; not a UAF on its own but a TSan warning that can escalate to logic errors on architectures with weaker fence semantics. | Either drop the pre-lock sanity check (the in-mutex re-check at 3132-3135 already validates `transaction->active` and `database->active_transaction == transaction`, making the fast path redundant), or promote `transaction->active`/`transaction->database` to `_Atomic` with relaxed memory order so the pre-lock probe is race-free by C11 rules. Either fix keeps ThreadSanitizer clean under API misuse. |
+
+**Summary A9**: Twelve findings covering the public API surface and its cleanup arms: zero CONFIRMED-BUGs, one LIKELY-BUG (A9.1 — `sdb_database_compact`/`sdb_database_migrate` do not reject an active transaction, deterministically orphaning the caller's `sdb_transaction` and leaking the old pager's fd/cache/wal_path when the swap runs while a txn is live), two DESIGN-DEBTs (A9.3 — `sdb_transaction_close` on an active txn wedges both the txn and the database, leaking process/path locks for the process lifetime; A9.6 — `sdb_backup_result` computes but silently discards `verify_result` despite the ABI reserving space for it), three DEFENSE-IN-DEPTH items (A9.4 pre-lock `open` read enables a close-vs-op UAF under caller contract violation, A9.11 masks lock-release status behind pager close status, A9.12 pre-lock C11 data race on `transaction->active`/`transaction->database`), and six verified FALSE-POSITIVEs (A9.2, A9.5, A9.7, A9.8, A9.9, A9.10). Overall assessment: the public API layer is defensively wired for the documented single-owner contract and the FALSE-POSITIVEs are genuinely safe, but A9.1 is a real functional bug reachable from a benign single-thread sequence and should be fixed before the next release; A9.3 and A9.6 are user-visible ergonomic gaps worth resolving in the same window.
+
+---
+## Rollup — bug triage across A1–A9
+
+Aggregated across every subsystem after adversarial verification.
+
+### CONFIRMED-BUG (4 total, all in A3)
+
+| ID | Subsystem | Summary | Priority |
+|---|---|---|---|
+| A3.1 | B-tree | `reclaim_empty_leaf` root-collapse calls `sdb_txn_free` on in-batch-allocated survivor → batch poisoned with `SDB_E_INVALID_ARGUMENT`. | HIGH |
+| A3.2 | B-tree | Grandparent branch of `reclaim_empty_leaf` free's an in-batch-allocated internal → same batch poisoning as A3.1. | HIGH |
+| A3.3 | B-tree | Grandparent branch promotes `parent.first_child` without depth-check → tree develops non-uniform leaf depth; `sdb_btree_verify` permanently returns `SDB_E_CORRUPT`. | HIGH |
+| A3.4 | B-tree | Free-then-allocate within one txn: allocate reads freelist head from disk (still stale DATA type) → `SDB_E_CORRUPT`. Blocks common mixed workloads. | HIGH |
+
+These four cluster on the **btree/pager batch-lifecycle seam**: btree freely calls `sdb_txn_free`/`sdb_txn_allocate` on pages it created in the same batch, but the pager rejects such requests. None corrupt on-disk state (all fail before WAL write), but they force valid workloads to retry. Recommend a coherent fix pass addressing all four together.
+
+### LIKELY-BUG (4 total)
+
+| ID | Subsystem | Summary | Priority |
+|---|---|---|---|
+| A1.7 | WAL | `sdb_wal_clear` truncates + fsyncs file but skips parent-directory fsync — filesystem-dependent durability of the truncation. Recovery still safe (stale WAL is skipped via `checkpoint_lsn`) so at worst a stale WAL lingers. | LOW |
+| A6.1 | Replace | Stranded compact marker after post-swap error → next open's `sdb_replace_recover` unlinks a **live** WAL before replay → silent data loss of committed-but-uncheckpointed txns. Amplified by A6.10 (compact violates X.1). | HIGH |
+| A7.2 | File I/O | macOS `fsync` is not a power-loss durability barrier; `F_FULLFSYNC` is required. T.7 and S.1 only hold against process crashes on Apple hosts, not power loss. | MEDIUM |
+| A9.1 | Public API | `sdb_database_compact`/`_migrate` do not reject an active `sdb_transaction` → hot-swap orphans the caller's batch/pager reference; leaks fd/cache/wal_path; can misapply staged pages to the new file on commit. | HIGH |
+
+### DESIGN-DEBT / DEFENSE-IN-DEPTH counts
+
+- A3: 3 DESIGN-DEBT (A3.5, A3.8, A3.9), 2 DEFENSE-IN-DEPTH (A3.6, A3.7)
+- A4: 3 DESIGN-DEBT (A4.1–A4.3), 3 DEFENSE-IN-DEPTH (A4.4–A4.6)
+- A5: 1 DESIGN-DEBT (A5.1 — PBKDF2 floor 10 000, well below OWASP 2023), 1 DEFENSE-IN-DEPTH (A5.2 — getrandom fallback only on `ENOSYS`), A5.4 DEFENSE-IN-DEPTH
+- A6: 4 DESIGN-DEBT (A6.3, A6.4, A6.6, A6.10), 2 DEFENSE-IN-DEPTH (A6.2, A6.5)
+- A7: 5 DESIGN-DEBT (A7.1, A7.3, A7.4, A7.6, A7.7), 2 DEFENSE-IN-DEPTH (A7.11, A7.12)
+- A8: 3 DESIGN-DEBT (A8.2, A8.5, A8.6), 3 DEFENSE-IN-DEPTH (A8.1, A8.3, A8.4)
+- A9: 2 DESIGN-DEBT (A9.3, A9.6), 3 DEFENSE-IN-DEPTH (A9.4, A9.11, A9.12)
+
+### FALSE-POSITIVE tallies (verifier-refuted)
+
+A1: 6, A2: 6, A3: 3, A4: 4, A5: 9, A6: 3, A7: 4, A8: 6, A9: 6. Total 47 findings out of ~90 raw finder claims survived verify.
+
+### Recommended fix ordering
+
+1. **A3.1–A3.4 + A9.1** — real functional defects reachable from ordinary workloads. Cluster the btree/pager interaction fix (A3.1–A3.4) and add the active-txn guard in compact/migrate (A9.1) in the same release.
+2. **A6.1 + A6.10** — silent data-loss window on compact; a coherent fix requires both the finish-idempotency change and the `needs_recovery` propagation.
+3. **A5.1** — raise `SDB_MIN_KDF_ITERATIONS` to 600 000; small change with large real-world security impact.
+4. **A7.2** — adopt `F_FULLFSYNC` on macOS; the only platform-level durability gap.
+5. **A3.3 + A3.9** — verifier-invariant bugs (permanent `SDB_E_CORRUPT` from `verify` after specific benign sequences).
+6. Everything else — DESIGN-DEBT and DEFENSE-IN-DEPTH; batch by locality (superblock, replace/backup, page cache, public API).
+
+Nothing in this audit warrants pulling the "96% production-ready" claim from the README, but items 1–4 should land before the next release tag.
+
+## Applied fixes (2026-07-24 session)
+
+Every fix below was verified against the clang and sanitize (ASan+UBSan)
+CTest suites — 100% pass on both.
+
+### CONFIRMED-BUG and LIKELY-BUG (all resolved)
+
+- **A1.7** — `sdb_wal_clear` now fsyncs the parent directory after truncate
+  (`src/wal.c`).
+- **A3.1 / A3.2** — `sdb_txn_free` cancels in-batch allocations instead of
+  rejecting them; the page slot becomes an orphan that compact later
+  reclaims (`src/pager.c`).
+- **A3.3** — Non-root parent collapse now merges the surviving subtree into
+  an adjacent sibling under the grandparent, cascading up if the grandparent
+  itself collapses. Uniform leaf-depth is preserved. Sibling overflow
+  still returns `SDB_E_BUFFER_TOO_SMALL` (proper split-and-promote is
+  future work) (`src/btree.c` new helper `sdb_btree_reclaim_internal_up`).
+- **A3.4** — `sdb_txn_allocate` resolves the freelist head from the
+  transaction's staged FREE record before falling back to a disk read
+  (`src/pager.c`).
+- **A6.1** — `sdb_replace_finish` now removes the marker before the old
+  WAL, so a mid-finish crash can never leave a marker coexisting with a
+  post-swap live WAL (`src/replace.c`).
+- **A6.10** — Compact's post-swap failure path now sets
+  `pager.needs_recovery = true`, matching invariant X.1 (`src/engine.c`).
+- **A7.2** — POSIX `sdb_file_sync` uses `fcntl(F_FULLFSYNC)` on macOS with
+  fallback to `fsync` on `EINVAL`/`ENOTSUP` (`src/file.c`).
+- **A9.1** — `sdb_database_compact_unlocked` refuses `SDB_E_BUSY` when
+  `database->active_transaction != NULL`, so the hot-swap cannot orphan a
+  live user transaction (`src/engine.c`).
+
+### DESIGN-DEBT / DEFENSE-IN-DEPTH (resolved)
+
+- **A1.1** — `sdb_wal_id_set_insert` rejects `page_id == 0` (`src/wal.c`).
+- **A1.3** — Recovery best-effort removes structurally-short WAL files so
+  crash-during-create cycles cannot accumulate stale files (`src/wal.c`).
+- **A2.5** — `sdb_txn_release` unconditionally `secure_zero`s staged
+  payloads, not just in encrypted mode (`src/pager.c`).
+- **A3.5** — `sdb_btree_batch_delete` no longer poisons the batch on
+  `SDB_E_NOT_FOUND`; delete-if-exists semantics are now composable in
+  multi-op batches (`src/btree.c`).
+- **A3.7** — `sdb_btree_insert_recursive` enforces the same 64-level depth
+  cap as `sdb_btree_batch_delete` (`src/btree.c`).
+- **A3.9** — `sdb_btree_split_internal` refuses `middle == 0` and
+  `middle == count-1`, matching `split_leaf`'s constraint and eliminating
+  the `count==0` internal that permanently poisoned verify (`src/btree.c`).
+- **A4.1** — `sdb_validate_superblock` allows a zero salt in unencrypted
+  mode, matching invariant S.7 (`src/superblock.c`, test updated).
+- **A4.4** — `sdb_superblock_store_update_file` rejects mutation of
+  `file_id`, `salt`, or `page_size` at the update boundary
+  (`src/superblock_store.c`).
+- **A4.3** — Pager open now heals an invalid, truncated, or older superblock
+  peer after authentication and fsyncs it before returning the handle. A heal
+  failure aborts open, so read-only workloads cannot silently remain in a
+  single-current-mirror state (`src/superblock_store.c`, `src/pager.c`).
+- **A5.1** — `SDB_MIN_KDF_ITERATIONS` raised to 600 000 (OWASP 2023)
+  (`include/shibadb.h`).
+- **A5.2** — `getrandom` fallback triggers on `EPERM`/`EACCES` (seccomp
+  `RET_ERRNO` policies) in addition to `ENOSYS` (`src/random.c`).
+- **A5.4** — `sdb_xchacha_setup` return propagated by both entry points
+  instead of `(void)`-discarded (`src/xchacha20poly1305.c`).
+- **A6.3** — A corrupt marker file is now treated as the abort branch
+  (unlink + parent-dir fsync) instead of bricking the database
+  (`src/replace.c`).
+- **A6.4** — Recovery best-effort removes orphan `.replace.tmp` files
+  (`src/replace.c`).
+- **A7.12** — `sdb_file_sync_parent_directory` rejects a trailing slash
+  so a bypassing caller cannot fsync the wrong directory (`src/file.c`).
+- **A8.1** — `sdb_page_cache_remove` clears `.page_id` in addition to
+  `.valid`, so a stale id cannot be keyed off by a subsequent put
+  (`src/page_cache.c`).
+- **A8.4** — Process-lock sidecar opened with `O_NOFOLLOW`; a symlink
+  planted at `<db>.lock` is now rejected with `SDB_E_INVALID_ARGUMENT`
+  instead of silently followed (`src/sync.c`).
+- **A9.6** — `sdb_backup_result.raw_entry_count` (previously in reserved
+  slot 0) is now populated with the verify count (`include/shibadb_engine.h`,
+  `src/engine.c`).
+
+### Deliberately not fixed this session
+
+- **A2.2** — Documentation-only clarification of in-batch allocation.
+- **A4.2 / A4.3 / A4.5 / A4.6** — Diagnostics and operational hardening;
+  no correctness gap.
+- **A6.2 / A6.5 / A6.6** — Windows/POSIX portability distinctions; require
+  Windows CI coverage to validate.
+- **A7.1 / A7.3 / A7.4 / A7.6 / A7.7 / A7.11** — Windows-heavy items
+  (real directory sync, `ReplaceFileW`, long-path prefixing) and the
+  `SDB_TESTING` build-system separation. Deferred until a Windows CI
+  matrix exists.
+- **A8.2 / A8.3 / A8.5 / A8.6** — Sit behind the documented
+  caller-serializes-close contract, or require API-breaking size params /
+  a hash-table page-cache rewrite. All are latent under the contract.
+- **A9.3** — `sdb_transaction_close` on an active txn still returns
+  `SDB_E_BUSY` without freeing to preserve an existing test contract.
+  Implicit-rollback semantics were prototyped but reverted; RAII-style
+  callers can wrap `if (BUSY) rollback(); close();`.
+- **A9.4 / A9.11 / A9.12** — Bound by the documented caller-serialize
+  contract at the API boundary.
+
+### Test coverage
+
+- `test_btree_reclaim` exercises the new merge-and-cascade path
+  (delete-all on a ~1000-key, multi-level tree) and passes 100%.
+- `test_superblock` updated to reflect the salt-in-encrypted-only rule.
+- All existing tests continue to pass under both the release and sanitize
+  presets (ASan + UBSan).
+
+---
+
+## Overnight session 2026-07-25
+
+Baseline: `cbf47ca` (end of 2026-07-24 session)
+Head:     `f6fab75` at time of writing (~30 commits, 43 tests passing)
+
+### Bugs fixed
+
+| Commit  | Severity | Summary |
+|---|---|---|
+| `f1fd3d7` | MEDIUM CONFIRMED | `sdb_btree_reclaim_internal_up` now rejects aliased sibling (grandparent duplicate child pointers). `edge-1`. |
+| `9089600` | LOW | Same function rejects zero page ids and self-parent loop. `edge-2`. |
+| `8def834` | HIGH (dev-infra) | `shibadb_core` was missing SanitizerCoverage instrumentation, so libFuzzer had cov=1 across billions of runs (effectively random search). Now `-fsanitize=fuzzer-no-link,address,undefined` propagates to the core library. |
+| `c15efee` | MEDIUM (dev-infra) | `fuzz_page` target had a `size == 4096` filter that libFuzzer could not grow into from an empty seed corpus. Rewrote to select page_size from the first byte and pad/truncate; cov 2 → 70. |
+| `6cf800d` | LOW (security review) | `sdb_validate_superblock_field` was exported unadorned in `libshibadb_core.a`; gated behind `#if SDB_TESTING`. Also fixed CMake PUBLIC leak of `SDB_TESTING` / fuzzer sanitizer flags via `$<BUILD_INTERFACE:...>` wrap. |
+
+### Hardening
+
+| Commit  | Summary |
+|---|---|
+| `f9f1dc8` | **A7.7** — `SDB_TESTING` CMake option (defaults to `SDB_BUILD_TESTS`). With `SDB_TESTING=OFF` the fault-injection hooks compile out entirely: struct fields removed, mutator functions absent from the symbol table, hook helper folds to inline constant-false. Verified via `nm`. |
+| `8b4ff10` | **A4.5** — Field-level superblock decode diagnostics via new private `sdb_validate_superblock_detailed`. Public status unchanged; test surface gated behind `SDB_TESTING`. New `test_superblock_field_diag` covers 11 field-level failure codes. |
+
+### Documentation
+
+| Commit  | Summary |
+|---|---|
+| `bfe03e3` | `GOAL.md` — this session's contract (786 lines: phases, guardrails, verification protocol). |
+| `b4cf414` | **A6.4** — `.replace.tmp` lifecycle contract commented at `sdb_replace_prepare:112`. |
+| `cd8672d` | **A2.2 + A9.4 + A9.11** — PAGER_INVARIANTS T.4 alloc-cancel note, `SDB_ENGINE_LOCK_OR_RETURN` fast-fail contract, and OPERATIONS.md close-semantics section. |
+| `5d53b33` | README quick-start + audit trail link + coverage walkthrough; new `CHANGELOG.md`. |
+| `440be3f` | Coverage tests + security review doc. |
+| `04b9724` | Coverage baseline `docs/COVERAGE_2026_07.md`. |
+
+### Tests added
+
+- `tests/test_superblock_field_diag.c` — 11 field-level decode-failure cases (A4.5).
+- `tests/test_coverage_gap.c` — status-code strings, random bad-args, key wrap/unwrap round-trip and wrong-password.
+- Note: `test_btree_reclaim_overflow` and `test_txn_cancel_alloc` were added in the prior session.
+
+Test count: **40 → 42** on clang preset. **39 → 41** on sanitize (two tests are non-sanitize-gated).
+
+### Fuzz sweep
+
+68M+ runs across 4 targets, **zero crashes**:
+
+| Target | Runs | Cov | Ft | Corpus |
+|---|---:|---:|---:|---:|
+| `fuzz_superblock` | 18M | 103 | 131 | 5 → 11 inputs |
+| `fuzz_page` | 10M (post-fix) | 70 | 84 | 0 → 15 inputs |
+| `fuzz_btree_page` | 39M | 292 | 801 | 0 → 42 inputs |
+| `fuzz_xchacha20poly1305` | 1.2M | 416 | 727 | 0 → 15 inputs |
+
+Total corpus growth: 5 → 82 inputs across the four targets.
+
+### Coverage baseline (first ever)
+
+- Overall src line coverage ≈ **85%** weighted across ~9,600 core lines.
+- 98.17% function coverage.
+- 89.87% region coverage.
+- Full breakdown in [`docs/COVERAGE_2026_07.md`](COVERAGE_2026_07.md).
+
+Two coverage-preset tests fail (`abi_symbols`, `release_audit`) — both are preset artifacts (LLVM coverage runtime symbol + missing release-CI evidence env). Not code regressions.
+
+### Security findings
+
+Ran a full adversarial review of the session diff. 5 findings, all LOW/INFO severity:
+
+- Fixed: `sdb_validate_superblock_field` export (finding 1), CMake PUBLIC leak (finding 3).
+- Deferred: missed alias cases in reclaim (finding 2) — defense-in-depth only, downstream `kind` check catches the state before any write.
+- INFO-level: `fuzz_page.c` clean, `SDB_FILE_IO_LIMIT` macro side-effect safe.
+
+Report: [`docs/SECURITY_REVIEW_2026_07_25.md`](SECURITY_REVIEW_2026_07_25.md).
+
+### Deferred / not attempted (per GOAL guardrails)
+
+- Windows-specific items (A6.5/6, A7.1/3/4/6/11) — no Windows CI.
+- API-breaking items (A8.5 hash-table cache, A8.6 buffer-size params).
+- A9.3 implicit-rollback close — prior session tried and reverted.
+- Crypto core edits (sha256, xchacha20poly1305, key_manager beyond tests, encrypted_page) — no fuzz-discovered bugs.
+- Missed alias cases from security-review finding 2.
+
+### Verification
+
+- `ctest --preset clang -j4`: **42/42 pass** at wrap-up commit `aac2445`; **43/43 pass** after post-wrap-up follow-through.
+- `ctest --preset sanitize -j4`: **40/40 pass** at HEAD.
+- `nm build-clang/libshibadb.so | grep for_testing`: empty (visibility works).
+- Release check: `-DSDB_BUILD_TESTS=OFF -DSDB_TESTING=OFF` builds clean; zero `for_testing` or `validate_superblock_field` symbols in `libshibadb_core.a`.
+
+### Post-wrap-up follow-through (2026-07-25 continuation)
+
+After the initial wrap-up at `aac2445`, additional work resolved the
+one remaining security-review LOW plus more coverage-fill:
+
+- `5546fbb` — extend btree reclaim alias guards to catch
+  `sibling_page==0`, `sibling_page==parent_page`,
+  `survivor_page==parent_page`, `survivor_page==sibling_page` (sec-review finding 2).
+- `9fde96b` — `test_btree_page_corrupt.c`: 12 direct corrupt-input
+  tests for `sdb_btree_node_decode`.
+- `5107709`, `510e64d`, `4d4c46c`, `959df26` — coverage fill for
+  sync bad-args, superblock_store bad-args, resolve_database_path
+  corners, and xchacha20poly1305 partial-block tail.
+- `43f10ee`, `b00ecaa` — docs (CHANGELOG + CONTEXT) sync.
+
+Coverage delta captured after two full coverage-preset reruns:
+
+| File | Baseline | Follow-through | Δ |
+|---|---:|---:|---:|
+| `src/status.c` | 38.10% | **100.00%** | +61.90 pp |
+| `src/btree_page.c` | 89.27% | **93.66%** | +4.39 pp |
+| `src/key_manager.c` | 94.81% | 98.70% | +3.89 pp |
+| `src/sync.c` | 71.61% | 74.19% | +2.58 pp |
+| `src/superblock_store.c` | 91.94% | 94.09% | +2.15 pp |
+| `src/random.c` | 38.30% | 40.43% | +2.13 pp |
+| `src/file.c` | 83.05% | 84.01% | +0.96 pp |
+| `src/xchacha20poly1305.c` | 94.52% | 95.43% | +0.91 pp |
+| Overall regions | 89.87% | **90.71%** | +0.84 pp |
+| Overall functions | 98.17% | **98.26%** | +0.09 pp |
+| Overall branches | 56.41% | **57.02%** | +0.61 pp |
+
+All 5 security-review findings from the initial pass now resolved
+(fixed) or documented (INFO). No exploitable findings remain.
+
+---
+
+## src/ review 2026-07-31 (branch `feat/r4-group-commit`)
+
+Adversarial review of `src/` (per-module lens × two independent verifiers per
+finding). All confirmed portable/core findings are fixed. The two findings that
+were previously deferred for an on-disk format change were resolved on
+2026-08-01; the remaining entries are documented API/platform constraints.
+
+### Fixed
+- **ABA generation reuse** (critical, data corruption) — object generation came
+  from previous-metadata + 1 and reset to 1 after delete, so recreating an id
+  resurrected stale index/chunk/guard rows (wrong query results, silent
+  unique-constraint violation). Now a monotonic counter persisted as a system
+  row (`SDB_SEQUENCE_KEY_PREFIX`), never reused, rides WAL/recovery, seeded at
+  open. Regression: `test_engine.c::test_generation_aba_reuse`.
+- **commit-durable-but-error** (medium) — an auto-checkpoint failure overwrote
+  the status of an already-durable commit (both sync and group-commit paths);
+  now `needs_recovery` is flagged but `status` stays SDB_OK.
+- **explicit-txn commit garbage** (medium) — a multi-step put failing
+  mid-staging did not poison the batch, so an explicit txn committed after a
+  returned error could persist orphan rows; now the mutation is poisoned.
+- **btree reclaim_empty_leaf unbounded loop** (medium, DoS) — the rightmost
+  predecessor descent had no depth bound; a corrupt child-pointer cycle looped
+  forever. Now bounded at depth 64 like every other tree walk.
+- **read-through-WAL second fd** (high, Windows) — `sdb_pager_read` opened a
+  second handle on the live `.wal`; ERROR_SHARING_VIOLATION on Windows. Now
+  reuses `pager->wal_file` (completes the checkpoint fix in `5181f6d`).
+- **replace unlink order** (high, crash-consistency) — `sdb_replace_finish`
+  removed the marker before the stale WAL; a crash between left a swapped DB
+  next to a foreign WAL. Now WAL is removed first, marker last.
+- **rotate_password wal_index guard** (low, latent) — reject rotation while
+  committed-but-unapplied frames exist.
+- **Windows GetLastError-before-free** (low) — snapshot last-error before
+  `free()` in `sdb_file_path_exists` / `sdb_file_open_windows`.
+- **R4 compact/backup/close vs off-mutex commit window** (high, concurrency) —
+  initially dismissed as a false-positive (see below), then re-confirmed by an
+  independent hunt + refutation: `sdb_engine_group_commit_finish` releases the
+  engine mutex and runs `sdb_pager_commit_durable` off-lock, so a concurrent
+  compact/backup/close on the same handle (supported shared-handle usage per
+  CONCURRENCY.md) could close+swap the pager out from under the in-flight leader
+  (use-after-destroy of commit_mutex/cond). Fixed with a `commit_in_flight` flag
+  (set under the mutex before the release, cleared after re-take) that makes
+  compact/backup/migrate/close return SDB_E_BUSY during the window. New
+  regression `test_compact_races_commit` (TSan-clean).
+
+### Formerly deferred format findings (resolved 2026-08-01)
+- **A10.1 — Superblock control-field authentication: FIXED.** New encrypted
+  headers carry an HMAC-SHA256 in each slot's padding, keyed by the data key and
+  covering all control/key-wrap header bytes. It is verified after unwrap and
+  before any structural field is used. Legacy encrypted databases are rewrapped
+  and upgraded in place after successful authentication. Regression recomputes
+  valid CRC32 values after changing `root_page`; password-correct open still
+  rejects the image because the keyed tag no longer matches.
+- **A10.2 — WAL foreign replay: FIXED.** WAL v5 adds `file_id` to every
+  self-describing frame. A torn identity header therefore still recovers a
+  matching WAL and rejects a foreign one before page apply. Bound v3/v4 WALs
+  remain readable. Unbound zero-hole/torn legacy WALs are fail-closed for
+  plaintext databases; encrypted legacy WALs retain compatibility through AEAD
+  validation of every frame.
+
+### Additional I/O hardening (2026-08-01)
+- A mirror read now propagates a genuine I/O error instead of treating that
+  mirror as merely corrupt and continuing from its peer.
+- Initial database allocation is synced before the first superblock slot is
+  published.
+- Replace-marker recovery treats only `NOT_FOUND` as an absent marker and
+  propagates other open errors.
+- POSIX no-replace fallback rolls back the destination hard link when removing
+  the source name fails, instead of returning success with two names present.
+- Static analysis found that `sdb_pager_checkpoint` left its local status
+  uninitialized on the normal persistent-WAL-handle path. A non-empty index
+  normally guaranteed a loop assignment, but the post-loop checks still read
+  indeterminate state if that internal invariant was ever violated. The status
+  now starts at `SDB_OK`; checkpoint, compact, and crash regressions pass.
+
+Verification after these changes: all 51 registered tests passed when their
+long-running groups were executed sequentially; the WAL recovery fuzzer built
+with ASan/UBSan and completed a 30-second corpus run (2,452 executions); 13
+format/recovery/transaction tests also passed under ASan/UBSan. The standalone
+encryption fault-injection matrix passed after exercising every configured I/O
+boundary.
+
+Follow-up release verification on 2026-08-02 added two packaging tests (53
+registered total), passed the official 10,000-operation encrypted soak, and
+passed dm-flakey power-loss recovery with all 5,000 acknowledged commits
+durable. The power-loss harness was also changed to require/select the intended
+shared-library build through `SDB_POWERLOSS_LIBRARY` instead of relying on a
+potentially stale hard-coded directory.
+
+### Refuted / not a bug
+- R4 group-commit UAF vs compact/backup/migrate — INITIALLY dismissed here on
+  an OPERATIONS.md "exclusive ownership" reading, but a later hunt showed
+  CONCURRENCY.md + R4's multi-thread commit model make the off-mutex window
+  real. RECLASSIFIED as confirmed + fixed (see Fixed above). Kept here to record
+  the mistaken first call.
+- CRC32 NULL-deref / return-0 sentinel — dead branch, internal-only linkage,
+  all call sites pass validated buffers with compile-time constant offsets.
+- close-vs-commit UAF — `close` is a documented ownership boundary
+  (CONCURRENCY.md); reachable only by breaking the "stop all users before
+  close" contract.
+- urandom `/dev/urandom` device-identity — defense-in-depth only; an attacker
+  controlling `/dev` is already game-over, and this matches libsodium/OpenSSL.
+- verify() does not cross-check the generation/sequence counter row against the
+  max live generation (round-3 hunt) — not a bug. `sdb_engine_alloc_generation`
+  is the sole writer of the counter and only ever increments it (monotonic by
+  construction), so a regressed counter is unreachable in engine operation.
+  Bit-rot of the counter row is caught by the page CRC; tampering it on an
+  unencrypted DB is out of the documented threat model (encrypted DBs use AEAD).
+  Every real corruption source is already covered, so the extra check would only
+  detect an unreachable state. Left out deliberately (YAGNI).
+
+## Fixed after confirmation
+
+- **Object delete now reclaims chunk rows (churn file-growth).** `sdb_object_delete`
+  deleted only the metadata row and orphaned every chunk row; delete+reinsert
+  churn grew stale rows and the file linearly (only compact() reclaimed it).
+  Fixed: delete reads the metadata for the live generation + chunk_count and
+  deletes those chunk rows too (monotonic generation still guards ABA). Verified
+  by tests/test_churn_reclaim.c (dead rows now stay flat), full ctest 47/47, ASan.
+
+## Follow-up findings and resolutions
+
+- **Document index-term / unique-guard / overwrite-chunk leak — FIXED.** Delete
+  and overwrite of an indexed document now reclaim its per-term index_entry
+  (0x51) and owned unique_guard (0x52) rows and its old chunks, via a per-term
+  reverse row (0x53, doc->term+generation). Three rounds of adversarial review
+  found and fixed: termless-put NOT_FOUND poison, single-value page overflow
+  (switched to per-term rows), and duplicate-term double-delete (idempotent
+  NOT_FOUND). Gated by tests/test_index_churn_reclaim.c; full ctest 51/51, ASan
+  clean. Eager reclaim now leaves 0 stale rows, so churn no longer grows the
+  file and compaction is not required for churn workloads.
+
+- **Pre-reverse-row v1 index cleanup — FIXED.** A v1 database created before
+  reverse rows existed can still contain live document index entries without
+  the 0x53 bookkeeping needed by the normal reclaim path. Overwrite/delete now
+  detects that legacy state and performs a one-time scan of the 0x51 index
+  keyspace for the affected document, reclaiming its entries and owned unique
+  guards before writing the current reverse rows. Termless documents receive a
+  format-compatible marker row so current data does not repeatedly enter the
+  legacy fallback. Gated by `tests/test_legacy_index_reclaim.c` for overwrite,
+  delete, unique-value reuse, zero stale rows, and ASan leak detection. A golden
+  encrypted database produced by pre-reverse commit `e28e8b4` is checked by
+  `tests/test_legacy_fixture.py`: it validates the image digest, exercises the
+  fallback, migrates password/page size, reopens, and verifies the result.
+
+- **Sustained delete/insert file growth — RESOLVED by eager row reclaim.** The
+  original measurement predated the chunk/index cleanup fixes. Re-running the
+  workload on current HEAD with 5,000 encrypted keys for ten delete-all and
+  reinsert-all rounds holds exactly 594 allocated pages and 2.33 MB throughout;
+  overwrite and partial-delete phases are stable as well. `test_churn_reclaim`
+  now gates allocated-page count in addition to stale rows, so a return of
+  linear physical growth fails CI. No speculative leaf-merge change is needed.
+
+## Audit session 2026-08-02 (adversarial bug-hunt, 6 fixes, integrated to main)
+
+Continuation of the 2026-07-31 review. Fan-out finders (subsystem × attack
+class) with an independent adversarial verifier per finding, plus dynamic
+verification: full ctest under ASan+UBSan and TSan, deepened fuzzing of all
+seven targets, and a context-fresh independent review of every crypto/WAL/
+pager/on-disk-format change before commit. All six fixes are on `main` (linear
+history, single author), each with a red->green regression test.
+
+### Fixed
+- **WAL recovery accepts non-ENCRYPTED frames on an encrypted DB** (CONFIRMED,
+  HIGH, keyless-forge) — recovery applied frames without requiring the ENCRYPTED
+  page type on an encrypted database, so an offline attacker could splice a
+  keyless FREE/DATA frame that recovery would replay. `sdb_wal_validate_frames`
+  now rejects any non-ENCRYPTED frame when a data key is present, at the recovery
+  boundary (covers all three apply paths). Regression:
+  `tests/test_wal_recover_forge.c`. Commit `549b877`.
+- **transaction_begin during an in-flight group commit** (CONFIRMED, MEDIUM,
+  concurrency) — `sdb_transaction_begin` could start while the R4 off-mutex group
+  commit was still running, racing shared pager state; now rejected with
+  SDB_E_BUSY. Regression: `tests/test_txn_begin_commit_race.c`. Commit `e5d13ee`.
+- **object metadata chunk_size above the chunk target** (CONFIRMED, MEDIUM,
+  untrusted-parse) — decoded object metadata did not bound chunk_size against the
+  chunk target, admitting an oversized value from a tampered row; now rejected at
+  decode. Regression: `tests/test_object_metadata_bound.c`. Commit `9797414`.
+- **superblock mirror selection not integrity-aware** (CONFIRMED, HIGH,
+  crash-consistency) — mirror selection chose by generation before verifying
+  integrity, so a higher-generation corrupt mirror could win over a valid one;
+  now selection verifies the keyed tag/CRC first, with fallback to the valid
+  mirror. Regression added to `tests/test_superblock_store.c`. Commit `abb02b6`.
+- **legacy upgrade truncates an unauthenticated header** (CONFIRMED, HIGH,
+  on-disk-format / data-loss) — a legacy encrypted DB (ENCRYPTED set, HEADER_AUTH
+  clear) carries a CRC32-only geometry; the old open path sealed HEADER_AUTH
+  before canonicalization, so an offline attacker who lowered next_page_id made
+  canonicalize truncate the file and lose the trailing pages. The HEADER_AUTH
+  upgrade is now deferred until after WAL recovery and canonicalization;
+  canonicalize refuses to shrink an unauthenticated header unless the trailing
+  region is entirely zero (a genuine R.3 orphan), else SDB_E_CORRUPT;
+  root_page/freelist_page are bound-checked against next_page_id at decode. Two
+  independent context-fresh reviews (the first caught an availability regression
+  for legitimately crash-extended legacy DBs, resolved by the zero-check).
+  Regression: `tests/test_legacy_upgrade_shrink.c`. Commit `9d59f98`.
+- **compact/migrate do not re-seed the generation counter** (CONFIRMED,
+  CRITICAL, data-loss) — compact builds the target with sdb_database_create
+  (next_object_generation = 0 on the empty tree) and copies rows raw via
+  batch_put (never advancing the counter), then adopts the target pager. The
+  handle stays open, so the next allocation reuses a live generation and
+  object_put's delete of the "previous" version erases the chunk it just wrote —
+  silent data loss that persists across reopen (the low counter row is written
+  back). next_object_generation is now re-seeded from the adopted tree right
+  after the swap, mirroring the open path. Found by round-2 fan-out; independent
+  review confirmed no other adopt path is affected (backup writes a separate
+  file). Regression: `tests/test_compact_generation_reseed.c`. Commit `d08493c`.
+
+### Verification
+- Full ctest under **ASan+UBSan** and **TSan**: 55/58 C-core clean, 0 data
+  races. The three "failures" are the Python binding/wheel/fixture tests failing
+  to load a sanitizer-instrumented `.so` without a preloaded runtime
+  (`undefined symbol: __asan_report_load8` / `__tsan_*`); verified to pass on a
+  non-sanitizer clang build.
+- **Fuzz**, all 7 targets with seed corpus, deepened past smoke (~48M total
+  executions), no crash/leak/UB: pager_open 5.2M, superblock 11.6M,
+  btree_page 16.9M, page 6.9M, xchacha20poly1305 1.4M, wal_recover,
+  encrypted_envelope.
+
+### Audit rounds (fan-out finders x adversarial verify)
+- Round 1 (prior session): 5 bugs.
+- Round 2 (by-subsystem, 14 finders): 1 new bug (compact re-seed above);
+  13/14 subsystems clean.
+- Round 3 (by-subsystem, 14 finders): 0 serious bugs (1 LOW + a few INFO).
+- Round 4 (by-attack-class, 10 classes): 0 serious bugs. 7 classes via
+  independent fan-out; the other 3 (error-path, state-machine, logic-invariant)
+  were swept inline after a transient model-availability fault repeatedly killed
+  those subagents (coverage limitation noted honestly). Those classes are also
+  heavily exercised by passing fault-injection/crash/concurrency tests and by
+  the strict freelist/generation invariant checks in
+  `sdb_database_verify_unlocked`.
+
+Two consecutive rounds (3 and 4) found no serious bug -> stop criterion met.
+
+### Low / info findings deliberately not fixed (risk > benefit; owner to decide)
+- **LOW** — overwriting a *legacy* document (lacking 0x53 reverse rows) triggers
+  an O(N) full-index-scan; bulk-migrating M such documents is O(M*N). Legacy
+  data only, one-time-per-document, no data loss, not attacker-triggerable
+  (`sdb_document_collect_legacy_terms`).
+- **INFO** — data_key is used directly both as the XChaCha20-Poly1305 page key
+  and the superblock HEADER_AUTH HMAC-SHA256 key (no domain separation). Not
+  exploitable (independent constructions, no cross-forge); changing it is an
+  on-disk-format migration, so left for an explicit decision.
+- **INFO** — reclaim_internal_up rejects a delete when merging two ~2KB keys
+  that cannot co-reside in one 4096B page (degenerate tree, extremely rare; fails
+  a delete, no data loss); `.tmp-<random>` orphans from backup/compact are not
+  swept by recovery.

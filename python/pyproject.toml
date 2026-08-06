@@ -1,0 +1,11 @@
+[project]
+name = "shibadb"
+version = "0.1.0"
+description = "Python binding for the ShibaDB C ABI"
+requires-python = ">=3.10"
+
+[project.scripts]
+shibadb = "shibadb.cli:main"
+
+[tool.shibadb]
+native-abi = 1

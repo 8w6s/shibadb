@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: ShibaDB
+Description: Dependency-free embedded database engine
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lshibadb
+Libs.private: @SHIBADB_PC_PRIVATE_LIBS@
+Cflags: -I${includedir}

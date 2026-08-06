@@ -1,0 +1,86 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: python scripts/package_release.py artifacts --epoch 1700000000
+      - run: cd artifacts && sha256sum -c SHA256SUMS
+      - run: >
+          python scripts/verify_security_bundle.py
+          artifacts/shibadb-1.0.0-security-review.zip
+      - name: Attest source artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: artifacts/**
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shibadb-source
+          path: artifacts/
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            platform: linux
+            compiler: GCC
+          - os: macos-latest
+            artifact: macos
+            platform: macos
+            compiler: AppleClang
+          - os: windows-latest
+            artifact: windows-x86_64
+            platform: windows
+            compiler: MSVC
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/stage
+      - run: cmake --build build --parallel
+      - run: cmake -E make_directory stage/evidence
+      - run: >
+          ctest --test-dir build --output-on-failure --timeout 1800
+          --no-tests=error
+          --output-junit "${{ github.workspace }}/stage/evidence/ctest.xml"
+      - run: cmake --install build
+      - name: Record native evidence
+        run: >
+          python scripts/release_evidence.py
+          --platform ${{ matrix.platform }}
+          --compiler ${{ matrix.compiler }}
+          --architecture ${{ runner.arch }}
+          --suite complete
+          --test-report "${{ github.workspace }}/stage/evidence/ctest.xml"
+          --output stage/evidence/native.json
+      - name: Attest native artifacts and evidence
+        uses: actions/attest@v4
+        with:
+          subject-path: stage/**
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shibadb-${{ matrix.artifact }}
+          path: stage/

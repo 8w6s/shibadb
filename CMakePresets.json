@@ -1,0 +1,142 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "gcc",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc"
+      }
+    },
+    {
+      "name": "clang",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang"
+      }
+    },
+    {
+      "name": "mingw",
+      "inherits": "base",
+      "toolchainFile": "${sourceDir}/cmake/mingw-x86_64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SDB_BUILD_TESTS": "OFF",
+        "SDB_TESTING": "OFF",
+        "SDB_HARDENED": "ON"
+      }
+    },
+    {
+      "name": "sanitize",
+      "inherits": "clang",
+      "cacheVariables": {
+        "SDB_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "clang",
+      "cacheVariables": {
+        "SDB_ENABLE_THREAD_SANITIZER": "ON"
+      }
+    },
+    {
+      "name": "soak",
+      "inherits": "release",
+      "cacheVariables": {
+        "SDB_ENABLE_SOAK_TESTS": "ON"
+      }
+    },
+    {
+      "name": "bench",
+      "inherits": "release",
+      "cacheVariables": {
+        "SDB_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SDB_ENABLE_FUZZERS": "ON",
+        "SDB_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "coverage",
+      "inherits": "clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-fprofile-instr-generate -fcoverage-mapping -O0 -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fprofile-instr-generate -fcoverage-mapping",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fprofile-instr-generate -fcoverage-mapping"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "gcc", "configurePreset": "gcc"},
+    {"name": "clang", "configurePreset": "clang"},
+    {"name": "mingw", "configurePreset": "mingw"},
+    {"name": "release", "configurePreset": "release"},
+    {"name": "sanitize", "configurePreset": "sanitize"},
+    {"name": "tsan", "configurePreset": "tsan"},
+    {"name": "soak", "configurePreset": "soak"},
+    {"name": "bench", "configurePreset": "bench"},
+    {"name": "fuzz", "configurePreset": "fuzz"},
+    {"name": "coverage", "configurePreset": "coverage"}
+  ],
+  "testPresets": [
+    {
+      "name": "gcc",
+      "configurePreset": "gcc",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "clang",
+      "configurePreset": "clang",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "soak",
+      "configurePreset": "soak",
+      "filter": {"include": {"name": "^engine_soak$"}},
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage",
+      "output": {"outputOnFailure": true},
+      "environment": {
+        "LLVM_PROFILE_FILE": "${sourceDir}/build-coverage/profiles/test-%p.profraw"
+      }
+    }
+  ]
+}
