@@ -171,6 +171,42 @@ artifact of the anti-vacuous guard, not a memory error, and the test passes on
 the normal build; the ASan lane should exclude it (or the guard loop should be
 made scheduler-robust). ASan found no defect in the engine.
 
+### Performance — 2026-08-07 (Windows MSVC, NVMe, encrypted)
+
+Fresh numbers on the build machine (faster storage than the earlier Linux
+figures). `bench_kv`/`bench_churn`/`bench_concurrent`, XChaCha20-encrypted,
+100 B values, MIN KDF. The benchmark timer was ported to `QueryPerformanceCounter`
+so the harness builds and runs natively under MSVC.
+
+| Workload | Result |
+|---|---|
+| get (auto-commit) | **24,062 ops/s**, P50 39 µs, P99 63 µs |
+| put (auto-commit) | 589 ops/s, P50 1.5 ms (fsync-bound floor) |
+| delete (auto-commit) | 801 ops/s |
+| put (batched, 1000/txn) | 10,343 ops/s |
+| churn, 50k keys | get P50 ~70 µs, stable across put/update/delete/reput/compact |
+| concurrent, 16 threads | 614 durable commits/s; **all 8,000 records intact after reopen** |
+
+### Crash-durability — real process kill (2026-08-07)
+
+`crash_writer` commits acknowledged increments to an encrypted DB while a driver
+**hard-kills it (TerminateProcess) mid-commit** and reopens. Across **24 hard
+kills**: every acked commit survived, the counter never regressed, and `verify`
+was OK on every reopen — **0 corruption, 0 lost acked commits**. This is a real
+process kill, not the fault-injection hook that `crash_injection` uses.
+
+### Adversarial / attack surface (2026-08-07)
+
+Against an encrypted database holding a secret value:
+- **6/6 wrong passwords** and a **no-password** open were all rejected; the
+  value is never returned without the correct key.
+- **192 single-byte flips** across the whole file, then opened with the
+  correct password: 64 detected and rejected (XChaCha20-Poly1305 tag / CRC),
+  128 landed on don't-care bytes and returned the correct value, and
+  **0 returned a silently-wrong value**.
+- Truncation (6 lengths) and random-garbage files: all rejected, **0 crashes**
+  anywhere across the ~230 attack cases.
+
 Not yet run on Windows (Clang-only, deferred to the Linux/Clang gate): UBSan,
 ThreadSanitizer, libFuzzer.
 

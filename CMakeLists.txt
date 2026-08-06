@@ -315,6 +315,8 @@ if(SDB_BUILD_TESTS)
     target_link_libraries(test_database_info PRIVATE ShibaDB::core)
     add_executable(test_convenience tests/test_convenience.c)
     target_link_libraries(test_convenience PRIVATE ShibaDB::core)
+    add_executable(crash_writer tests/crash_writer.c)
+    target_link_libraries(crash_writer PRIVATE ShibaDB::core)
     add_executable(test_superblock_field_diag tests/test_superblock_field_diag.c)
     target_link_libraries(test_superblock_field_diag PRIVATE ShibaDB::core)
     add_executable(test_coverage_gap tests/test_coverage_gap.c)
@@ -503,6 +505,7 @@ if(SDB_BUILD_TESTS)
         target_compile_options(test_superblock PRIVATE /W4 /WX)
         target_compile_options(test_database_info PRIVATE /W4 /WX)
         target_compile_options(test_convenience PRIVATE /W4 /WX)
+        target_compile_options(crash_writer PRIVATE /W4 /WX)
         target_compile_options(test_codec PRIVATE /W4 /WX)
         target_compile_options(test_file PRIVATE /W4 /WX)
         target_compile_options(test_utf8_path PRIVATE /W4 /WX)
@@ -561,6 +564,9 @@ if(SDB_BUILD_TESTS)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
         )
         target_compile_options(test_convenience PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+        target_compile_options(crash_writer PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
         )
         target_compile_options(test_codec PRIVATE

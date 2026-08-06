@@ -7,6 +7,10 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 static const char *bench_path = "bench-kv.tmp";
 static const char *bench_wal_path = "bench-kv.tmp.wal";
 static const char *bench_lock_path = "bench-kv.tmp.lock";
@@ -17,10 +21,20 @@ static const uint8_t bench_password[] = "benchmark-password";
 
 static uint64_t bench_now_ns(void)
 {
+#ifdef _WIN32
+    LARGE_INTEGER freq;
+    LARGE_INTEGER count;
+    (void)QueryPerformanceFrequency(&freq);
+    (void)QueryPerformanceCounter(&count);
+    return (uint64_t)(count.QuadPart / freq.QuadPart) * UINT64_C(1000000000)
+        + (uint64_t)(count.QuadPart % freq.QuadPart) * UINT64_C(1000000000)
+            / (uint64_t)freq.QuadPart;
+#else
     struct timespec ts;
     (void)clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * UINT64_C(1000000000)
         + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 static uint64_t bench_env_u64(const char *name, uint64_t fallback)
