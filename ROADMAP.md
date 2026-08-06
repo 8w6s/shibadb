@@ -1,4 +1,4 @@
-# Production-readiness roadmap
+﻿# Production-readiness roadmap
 
 Progress is earned only when the capability exists **and** its reliability
 gate passes. Lines of code and partially implemented features do not count.
@@ -15,7 +15,7 @@ gate passes. Lines of code and partially implemented features do not count.
 | KV, documents, blobs and indexes | 11% | 11% | public conformance suite |
 | Concurrency and process locking | 7% | 7% | multi-thread/process soak tests |
 | Backup, verify, compact and migration | 6% | 6% | failure-safe operational tests |
-| Stable C ABI and language bindings | 3% | 3% | ABI compatibility + install-consumer test |
+| Stable C ABI | 3% | 3% | ABI compatibility + install-consumer test |
 | Cross-platform hardening and release gates | 4% | 2% | Linux/macOS/Windows CI and long soak |
 | **Implementation total** | **100%** | **98%** | |
 
@@ -33,7 +33,7 @@ explicit secondary/unique indexes, serialized shared-handle thread safety with
 hardened POSIX lock-sidecar (S_ISREG + nlink==1 checks), crash-released
 exclusive process locking, deep verification, atomic snapshots, logical
 compaction, explicit migration, a versioned C ABI with Doxygen-documented
-public headers, an in-tree Python binding, installable static/shared packages
+public headers, installable static/shared packages
 with distribution hardening (RELRO, BIND_NOW, CET, stack canaries,
 FORTIFY_SOURCE), and MIT licensing. The Linux release gate has deterministic
 packaging/auditing and a durability battery: a 500,000-operation encrypted
@@ -46,7 +46,7 @@ Linux GCC/Clang, macOS Clang, and Windows MSVC exists and is set up in
 `.github/workflows/ci.yml`; the release-candidate workflow emits
 commit-bound evidence with signed provenance for each platform. The
 remaining 2% is awarded when the native macOS and Windows runs actually
-land — i.e. once the repository is public and the first `v1.0.0-rc*`
+land â€” i.e. once the repository is public and the first `v1.0.0-rc*`
 tag triggers all three OS jobs successfully.
 
 Not yet fully production-ready: **the native macOS and Windows release

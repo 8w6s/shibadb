@@ -1,6 +1,6 @@
-# ShibaDB
+﻿# ShibaDB
 
-Embedded ACID key-value database in C11 — optional authenticated encryption, single-file,
+Embedded ACID key-value database in C11 â€” optional authenticated encryption, single-file,
 crash-safe, ~15k LOC, MIT-licensed.
 
 [![CI](https://github.com/8w6s/shibadb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/8w6s/shibadb/actions/workflows/ci.yml)
@@ -8,9 +8,9 @@ crash-safe, ~15k LOC, MIT-licensed.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Pre-1.0 / release candidate.** shibadb-c is 98% ready per
-> [ROADMAP.md](ROADMAP.md). Crash consistency now has direct evidence —
+> [ROADMAP.md](ROADMAP.md). Crash consistency now has direct evidence â€”
 > SIGKILL crash-injection and a dm-flakey power-loss gate (see
-> [RELEASE.md](RELEASE.md)) — but an *independent* cryptography /
+> [RELEASE.md](RELEASE.md)) â€” but an *independent* cryptography /
 > crash-consistency audit has **not** happened yet, and signed native
 > macOS/Windows release evidence is still pending (see
 > [docs/PORTABILITY.md](docs/PORTABILITY.md)). **Do not use for production data
@@ -25,7 +25,7 @@ candidates.
 ## What it is
 
 ShibaDB is an embedded ACID key-value database written in portable C11. It
-links into your application as a static or shared library — no server, no
+links into your application as a static or shared library â€” no server, no
 network, no separate daemon. One database is one file (plus a WAL sidecar
 during writes).
 
@@ -46,14 +46,12 @@ during writes).
   `compact`, explicit `migrate` (password rotation, page-size change).
 - **Stable C ABI**: `SDB_ABI_VERSION = 1`, semver-tagged, versioned headers,
   CMake `find_package(shibadb)` and pkg-config integration.
-- **Python binding**: in-tree (`python/`), wheel-installable, tracks the C
-  ABI, exercised by the `python_binding` CTest. See [docs/PYTHON.md](docs/PYTHON.md).
 
 ## Platform matrix
 
 | Platform | Compiler           | Status                                        |
 |----------|--------------------|-----------------------------------------------|
-| Linux    | GCC 12+, Clang 15+ | Verified — full CTest, 500k-op encrypted soak, crash-injection, dm-flakey power-loss |
+| Linux    | GCC 12+, Clang 15+ | Verified â€” full CTest, 500k-op encrypted soak, crash-injection, dm-flakey power-loss |
 | macOS    | Apple Clang        | Native PR/RC gates configured; signed candidate evidence pending |
 | Windows  | MSVC 2022 / MinGW | Native PR/RC gates configured; MinGW + 48 Wine C tests pass; signed candidate evidence pending |
 
@@ -93,7 +91,7 @@ int main(void) {
 ```
 
 All functions return an `sdb_status`; `SDB_OK` is success. Get operations
-report the required buffer size — pass `NULL`/`0` to size a value before
+report the required buffer size â€” pass `NULL`/`0` to size a value before
 allocating.
 
 ## Quickstart
@@ -134,31 +132,30 @@ cc myapp.c $(pkg-config --cflags --libs shibadb) -o myapp
 
 ## Documentation
 
-- [docs/ENGINE_API.md](docs/ENGINE_API.md) — high-level engine API,
+- [docs/ENGINE_API.md](docs/ENGINE_API.md) â€” high-level engine API,
   lifecycle, transactions, output buffers, visitor reentrancy.
-- [docs/CONCURRENCY.md](docs/CONCURRENCY.md) — handle sharing, process
+- [docs/CONCURRENCY.md](docs/CONCURRENCY.md) â€” handle sharing, process
   locking, `SDB_E_BUSY` semantics.
-- [docs/ENCRYPTION.md](docs/ENCRYPTION.md) — key hierarchy, KDF work factor,
+- [docs/ENCRYPTION.md](docs/ENCRYPTION.md) â€” key hierarchy, KDF work factor,
   password rotation, legacy-file migration.
-- [docs/PAGER_INVARIANTS.md](docs/PAGER_INVARIANTS.md) — pager cache, WAL,
+- [docs/PAGER_INVARIANTS.md](docs/PAGER_INVARIANTS.md) â€” pager cache, WAL,
   and page-envelope invariants.
-- [docs/PUBLIC_TRANSACTIONS.md](docs/PUBLIC_TRANSACTIONS.md) —
+- [docs/PUBLIC_TRANSACTIONS.md](docs/PUBLIC_TRANSACTIONS.md) â€”
   multi-operation transaction contract.
 - [docs/WAL_FORMAT.md](docs/WAL_FORMAT.md) and
-  [docs/BTREE_FORMAT.md](docs/BTREE_FORMAT.md) — on-disk formats.
-- [docs/OPERATIONS.md](docs/OPERATIONS.md) — verify, backup, compact,
+  [docs/BTREE_FORMAT.md](docs/BTREE_FORMAT.md) â€” on-disk formats.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) â€” verify, backup, compact,
   migrate.
-- [docs/ABI.md](docs/ABI.md) — versioning and symbol-export policy.
-- [docs/PYTHON.md](docs/PYTHON.md) — Python binding notes.
+- [docs/ABI.md](docs/ABI.md) â€” versioning and symbol-export policy.
 
 ## Roadmap and release
 
-- [ROADMAP.md](ROADMAP.md) — weighted readiness table and per-area exit gates.
-- [RELEASE.md](RELEASE.md) — evidence required for a production release.
-- [CHANGELOG.md](CHANGELOG.md) — release-candidate history.
-- [SECURITY.md](SECURITY.md) — supported versions, in-scope surface, private
+- [ROADMAP.md](ROADMAP.md) â€” weighted readiness table and per-area exit gates.
+- [RELEASE.md](RELEASE.md) â€” evidence required for a production release.
+- [CHANGELOG.md](CHANGELOG.md) â€” release-candidate history.
+- [SECURITY.md](SECURITY.md) â€” supported versions, in-scope surface, private
   reporting.
-- [CONTRIBUTING.md](CONTRIBUTING.md) — build presets, sanitizer runs, test
+- [CONTRIBUTING.md](CONTRIBUTING.md) â€” build presets, sanitizer runs, test
   layout, review workflow.
 
 Remaining pre-1.0 work: native macOS + Windows release evidence bound to a

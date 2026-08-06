@@ -291,7 +291,6 @@ if(SDB_BUILD_TESTS)
     else()
         add_compile_options(-UNDEBUG)
     endif()
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_executable(test_abi tests/test_abi.c)
     target_link_libraries(test_abi PRIVATE ShibaDB::shared)
     add_executable(test_superblock tests/test_superblock.c)
@@ -730,27 +729,6 @@ if(SDB_BUILD_TESTS)
     add_test(
         NAME txn_begin_commit_race COMMAND test_txn_begin_commit_race
     )
-    # The Python ctypes binding has its own contract (handle lifetime, buffer
-    # keepalive, callback safety) that the C tests cannot cover. Run it against
-    # the freshly-built shared library so a regression in python/shibadb is
-    # caught by ctest instead of shipping silently.
-    add_test(
-        NAME python_binding
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_binding.py
-    )
-    set_tests_properties(python_binding PROPERTIES ENVIRONMENT
-        "SHIBADB_LIBRARY=$<TARGET_FILE:shibadb_shared>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-    )
-    add_test(
-        NAME legacy_fixture
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_legacy_fixture.py
-    )
-    set_tests_properties(legacy_fixture PROPERTIES ENVIRONMENT
-        "SHIBADB_LIBRARY=$<TARGET_FILE:shibadb_shared>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-    )
-
     # Exercise the installed package, not merely in-tree targets. This catches
     # missing headers, broken exported target names, bad pkg-config metadata,
     # and C/C++ consumer regressions before release.
@@ -773,18 +751,7 @@ if(SDB_BUILD_TESTS)
             -P ${CMAKE_CURRENT_BINARY_DIR}/test_install_consumer.cmake
     )
 
-    # Build a wheel, install it into an isolated virtual environment, and run
-    # the binding conformance test through that installed package.
-    add_test(
-        NAME python_wheel
-        COMMAND ${CMAKE_COMMAND}
-            -DPYTHON=${Python3_EXECUTABLE}
-            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-            -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}
-            -DLIBRARY=$<TARGET_FILE:shibadb_shared>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_wheel.cmake
-    )
-    set_tests_properties(install_consumer python_wheel PROPERTIES
+    set_tests_properties(install_consumer PROPERTIES
         LABELS packaging
         RUN_SERIAL TRUE
     )
