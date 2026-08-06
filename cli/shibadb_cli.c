@@ -405,6 +405,40 @@ static int cmd_verify(const char *path, const cli_options *opts) {
     return 0;
 }
 
+/*
+ * health opens the engine (unlike info, which only reads the superblock file)
+ * and reports the O(1) configuration snapshot from sdb_database_info. It is the
+ * "does this database open cleanly, and what is it?" probe: a non-zero exit
+ * means open/recovery failed.
+ */
+static int cmd_health(const char *path, const cli_options *opts) {
+    sdb_database *db = NULL;
+    sdb_status st = open_db(path, opts, &db);
+    if (st != SDB_OK) {
+        return fail("open", st);
+    }
+    sdb_info_result info;
+    memset(&info, 0, sizeof(info));
+    st = sdb_database_info(db, &info);
+    sdb_status close_st = sdb_database_close(db);
+    if (st != SDB_OK) {
+        return fail("health", st);
+    }
+    if (close_st != SDB_OK) {
+        return fail("health (close)", close_st);
+    }
+    printf("page_size:      %" PRIu32 "\n", info.page_size);
+    printf("encrypted:      %s\n", info.encrypted ? "yes" : "no");
+    if (info.encrypted) {
+        printf("kdf_iterations: %" PRIu32 "\n", info.kdf_iterations);
+    }
+    printf("generation:     %" PRIu64 "\n", info.generation);
+    printf("checkpoint_lsn: %" PRIu64 "\n", info.checkpoint_lsn);
+    printf("page_count:     %" PRIu64 "\n", info.page_count);
+    printf("health: OK\n");
+    return 0;
+}
+
 static int cmd_backup(const char *path, const char *dest,
                       const cli_options *opts) {
     sdb_database *db = NULL;
@@ -488,6 +522,7 @@ static int usage(FILE *out) {
 "  scan       <file> <ns>          Print key<TAB>value lines\n"
 "  namespaces <file>               List populated (kind, namespace) pairs\n"
 "  verify     <file>               Deep structural verification\n"
+"  health     <file>               Open the engine and print a config snapshot\n"
 "  backup     <file> <dest>        Atomic snapshot to a new file\n"
 "  compact    <file>               Reclaim stale space in place\n"
 "\n"
@@ -560,6 +595,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "verify") == 0) {
         if (npos != 1) { fprintf(stderr, "shibadb: verify <file>\n"); rc = 1; }
         else { rc = cmd_verify(pos[0], &opts); }
+    } else if (strcmp(cmd, "health") == 0) {
+        if (npos != 1) { fprintf(stderr, "shibadb: health <file>\n"); rc = 1; }
+        else { rc = cmd_health(pos[0], &opts); }
     } else if (strcmp(cmd, "backup") == 0) {
         if (npos != 2) { fprintf(stderr, "shibadb: backup <file> <dest>\n"); rc = 1; }
         else { rc = cmd_backup(pos[0], pos[1], &opts); }

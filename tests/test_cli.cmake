@@ -88,6 +88,11 @@ expect_contains("${out}" "verify: OK" "verify")
 run(0 out info "${DB}")
 expect_contains("${out}" "encrypted:      no" "info plaintext")
 
+# health opens the engine and reports the sdb_database_info snapshot
+run(0 out health "${DB}")
+expect_contains("${out}" "health: OK" "health")
+expect_contains("${out}" "encrypted:      no" "health plaintext")
+
 # backup produces a readable copy
 run(0 out backup "${DB}" "${BAK}")
 run(0 out get "${BAK}" users alice)
@@ -116,6 +121,8 @@ expect_contains("${out}" "encrypted:      yes" "info encrypted")
 run(0 out compact "${ENC}" --password "${PW}")
 run(0 out verify "${ENC}" --password "${PW}")
 expect_contains("${out}" "verify: OK" "encrypted verify")
+run(0 out health "${ENC}" --password "${PW}")
+expect_contains("${out}" "encrypted:      yes" "health encrypted")
 
 # --- misuse: non-zero, not a crash ---
 run(1 out get "${DB}")
