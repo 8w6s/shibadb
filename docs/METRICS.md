@@ -147,6 +147,24 @@ smaller batch (~100-200) keeps commit latency and tail bounded.
 Lowest coverage is `random.c` (39% line) and `sync.c` (77%): syscall error
 paths (getrandom / pthread) that need fault injection, not correctness-critical.
 
+## Windows-native evidence — 2026-08-07 (MSVC, local)
+
+First native-Windows gate run. Toolchain: MSVC 14.51 (`cl` 19.51) + Ninja,
+`RelWithDebInfo`. The project had previously only been gated on Linux.
+
+| Check | Result |
+|---|---|
+| Build `/W4 /WX`, no suppressions | Clean. Every C4701 (false positives from MSVC's inter-procedural flow analysis not modelling the `status == SDB_OK ⇒ out-param written` contract) and C4996 (`sscanf` in two tests) was fixed at source, so `/wd4701` and `_CRT_SECURE_NO_WARNINGS` were removed from the build entirely |
+| `ctest` (57 tests) | 57/57 pass |
+| Engine soak (`test_engine_soak`, `SDB_SOAK_OPERATIONS=50000`) | exit 0 in ~10.5 min; mixed put/delete/get with periodic verify, backup+reopen, and compact; 0 assertion failures |
+| Path robustness fix | `sdb_database_open` now accepts forward-slash paths (was `SDB_E_IO` because the `\\?\` extended-length prefix disables Win32 `/`→`\` normalization); create/open/lock are now consistent. See `docs/WINDOWS.md` |
+
+Not yet run on Windows (Clang-only, deferred to the Linux/Clang gate): UBSan,
+ThreadSanitizer, libFuzzer. AddressSanitizer via MSVC `/fsanitize=address` is
+being added as a Windows memory-safety pass.
+
+See `docs/WINDOWS.md` for the full Windows build/portability standard.
+
 ## Next
 
 Phase 1 hardening — 4 pillar parallel + CI infra. See `docs/superpowers/plans/2026-07-28-phase-1-4pillar.md` (to be written).
