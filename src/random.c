@@ -52,6 +52,16 @@ static sdb_status sdb_random_bytes_getrandom(uint8_t *output, size_t size)
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) \
     || defined(__OpenBSD__) || defined(__DragonFly__)
+/*
+ * getentropy() is declared in <sys/random.h> on macOS and FreeBSD. Under the
+ * strict feature macros this target sets (_POSIX_C_SOURCE / _XOPEN_SOURCE),
+ * <unistd.h> alone does not expose it there, so the -Werror build fails with an
+ * implicit-declaration error. The other BSDs declare getentropy() in
+ * <unistd.h> (already included above) and lack <sys/random.h>.
+ */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/random.h>
+#endif
 static sdb_status sdb_random_bytes_getentropy(uint8_t *output, size_t size)
 {
     uint8_t *cursor = output;

@@ -105,9 +105,12 @@ jobs:
             platform: Windows
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
+      # The native ctest suite is pure C now (the Python binding was removed),
+      # so no Python is needed here. Windows uses the Ninja generator, which
+      # needs the MSVC toolchain on PATH — set it up via the dev-cmd action.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
