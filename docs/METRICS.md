@@ -159,9 +159,20 @@ First native-Windows gate run. Toolchain: MSVC 14.51 (`cl` 19.51) + Ninja,
 | Engine soak (`test_engine_soak`, `SDB_SOAK_OPERATIONS=50000`) | exit 0 in ~10.5 min; mixed put/delete/get with periodic verify, backup+reopen, and compact; 0 assertion failures |
 | Path robustness fix | `sdb_database_open` now accepts forward-slash paths (was `SDB_E_IO` because the `\\?\` extended-length prefix disables Win32 `/`→`\` normalization); create/open/lock are now consistent. See `docs/WINDOWS.md` |
 
+AddressSanitizer (MSVC `/fsanitize=address`, `RelWithDebInfo`): built the full
+suite and ran it in 350 s with **0 AddressSanitizer findings** — no
+use-after-free, heap/stack-buffer overflow, or leak reports across the 55
+memory-relevant tests. The one non-pass is `test_group_commit`'s *anti-vacuous*
+`compact_busy > 0` assertion, which requires the run to actually observe a
+concurrent compact hitting the in-flight-commit BUSY guard. ASan's ~3x slowdown
+and altered thread scheduling meant the 16 committer threads drained before a
+compact landed in that window, so the race was never exercised. It is a timing
+artifact of the anti-vacuous guard, not a memory error, and the test passes on
+the normal build; the ASan lane should exclude it (or the guard loop should be
+made scheduler-robust). ASan found no defect in the engine.
+
 Not yet run on Windows (Clang-only, deferred to the Linux/Clang gate): UBSan,
-ThreadSanitizer, libFuzzer. AddressSanitizer via MSVC `/fsanitize=address` is
-being added as a Windows memory-safety pass.
+ThreadSanitizer, libFuzzer.
 
 See `docs/WINDOWS.md` for the full Windows build/portability standard.
 

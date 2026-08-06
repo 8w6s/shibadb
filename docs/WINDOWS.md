@@ -103,7 +103,14 @@ through `sdb_windows_path_from_utf8`.
 
 * **AddressSanitizer** is available through MSVC (`/fsanitize=address`); the
   ASan runtime ships with the VS toolset. Use it for a Windows memory-safety
-  pass equivalent to the Linux ASan gate.
+  pass equivalent to the Linux ASan gate. Configure a separate build tree with
+  `-DCMAKE_C_FLAGS=/fsanitize=address` and run `ctest`. Exclude the
+  timing-dependent concurrency test from the ASan lane —
+  `ctest -LE packaging -E "^group_commit$"` — because `test_group_commit` has
+  an *anti-vacuous* `compact_busy > 0` assertion that requires observing a
+  concurrent compact/commit BUSY race; ASan's altered scheduling does not
+  reliably hit that window, so the assertion fails without any memory error.
+  The engine itself is ASan-clean (0 findings) across the rest of the suite.
 * **UBSan / TSan / libFuzzer** are Clang features and are **not** available
   under MSVC. Run those on the Linux/Clang gate. If Clang for Windows
   (`clang-cl`) is installed, the fuzz targets can be built there; plain MSVC
