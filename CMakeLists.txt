@@ -36,6 +36,7 @@ set(SHIBADB_SOURCES
     src/codec.c
     src/encrypted_page.c
     src/engine.c
+    src/engine_convenience.c
     src/file.c
     src/key_manager.c
     src/page.c
