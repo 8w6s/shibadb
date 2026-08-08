@@ -780,7 +780,23 @@ sdb_status sdb_pager_checkpoint(sdb_pager *pager)
         wal_opened = true;
         wal_ptr = &wal;
     }
-    for (slot = 0U; slot < pager->wal_index.capacity; ++slot) {
+    /*
+     * Write-ahead invariant: the WAL frames about to be copied into the data
+     * file MUST be durable before the data file (then the superblock) starts
+     * reflecting them. In SDB_SYNCHRONOUS_FULL the WAL was already fsynced at
+     * each commit, so this is a cheap near-no-op. In SDB_SYNCHRONOUS_NORMAL,
+     * where per-commit fsync is skipped, this is the barrier that makes
+     * checkpointed commits durable and stops the data file from getting ahead
+     * of a recoverable WAL — without it a power loss between the data-file fsync
+     * and the superblock update could leave a page holding a future (yet
+     * CRC/tag-valid) version that the recovered btree never references, i.e.
+     * silent structural corruption rather than the promised clean tail loss.
+     */
+    if (pager->wal_file_open) {
+        status = sdb_file_sync(&pager->wal_file);
+    }
+    for (slot = 0U; status == SDB_OK && slot < pager->wal_index.capacity;
+         ++slot) {
         const uint64_t page_id = pager->wal_index.slots[slot].page_id;
         const uint64_t wal_offset = pager->wal_index.slots[slot].wal_offset;
         uint64_t page_offset;
@@ -2099,6 +2115,13 @@ void sdb_pager_set_defer_commit(sdb_pager *pager, bool defer)
     }
 }
 
+void sdb_pager_set_sync_relaxed(sdb_pager *pager, bool relaxed)
+{
+    if (pager != NULL) {
+        pager->sync_relaxed = relaxed;
+    }
+}
+
 bool sdb_pager_take_pending(sdb_pager *pager, uint64_t *txn_id_out)
 {
     if (pager == NULL || !pager->pending_valid) {
@@ -2129,6 +2152,20 @@ static sdb_status sdb_pager_fsync_locked(sdb_pager *pager)
     const uint64_t target = pager->written_lsn;
     sdb_status io_status = SDB_OK;
     if (pager->durable_lsn >= target) {
+        return SDB_OK;
+    }
+    /*
+     * SDB_SYNCHRONOUS_NORMAL: the txn's WAL bytes are already pwritten (in the
+     * OS page cache and visible to read-through-WAL). Acknowledge without the
+     * fsync barrier and let durability fold into the next checkpoint's fsync.
+     * durable_lsn is guarded by commit_mutex, which is held here, so this needs
+     * no unlock/relock and does not touch the leader/follower protocol. Commits
+     * survive a process crash (bytes remain in the OS cache) but the tail since
+     * the last checkpoint can be lost on power loss; checkpoint fsyncs the WAL
+     * before copying frames, so there is never corruption.
+     */
+    if (pager->sync_relaxed) {
+        pager->durable_lsn = target;
         return SDB_OK;
     }
     sdb_mutex_unlock(&pager->commit_mutex);

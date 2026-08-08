@@ -34,6 +34,7 @@ typedef struct cli_options {
     uint32_t kdf_iterations;/* 0 = engine default */
     const char *prefix;     /* scan prefix, NULL = whole namespace */
     uint64_t limit;         /* 0 = unlimited */
+    uint64_t synchronous;   /* SDB_SYNCHRONOUS_FULL (0) or _NORMAL (1) */
     bool force;             /* backup: replace existing destination */
     bool unique;            /* mkindex: create a unique index */
     const char *index_specs[16]; /* docput: repeated --index name=value */
@@ -46,6 +47,7 @@ static void cli_options_init(cli_options *opts) {
     opts->kdf_iterations = 0U;
     opts->prefix = NULL;
     opts->limit = 0U;
+    opts->synchronous = 0U;
     opts->force = false;
     opts->unique = false;
     opts->index_count = 0U;
@@ -92,6 +94,21 @@ static int cli_parse_options(int argc, char **argv, cli_options *opts,
                 return -1;
             }
             opts->limit = (uint64_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(arg, "--synchronous") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "shibadb: --synchronous requires a value\n");
+                return -1;
+            }
+            const char *mode = argv[++i];
+            if (strcmp(mode, "full") == 0) {
+                opts->synchronous = SDB_SYNCHRONOUS_FULL;
+            } else if (strcmp(mode, "normal") == 0) {
+                opts->synchronous = SDB_SYNCHRONOUS_NORMAL;
+            } else {
+                fprintf(stderr,
+                        "shibadb: --synchronous must be 'full' or 'normal'\n");
+                return -1;
+            }
         } else if (strcmp(arg, "--force") == 0 || strcmp(arg, "-f") == 0) {
             opts->force = true;
         } else if (strcmp(arg, "--unique") == 0) {
@@ -143,6 +160,7 @@ static void fill_db_options(sdb_database_options *db_opts,
     if (opts->kdf_iterations != 0U) {
         db_opts->kdf_iterations = opts->kdf_iterations;
     }
+    db_opts->synchronous = opts->synchronous;
 }
 
 /* Map an sdb_status to a small non-zero process exit code (2..) . */
@@ -783,6 +801,9 @@ static int usage(FILE *out) {
 "      --kdf-iterations <n>  PBKDF2 iterations for create\n"
 "      --prefix <p>      Restrict scan to keys with this prefix\n"
 "      --limit <n>       Max entries for scan (0 = all)\n"
+"      --synchronous <m> Durability of auto-commits: full (default) or\n"
+"                        normal (faster; may lose the newest commits on\n"
+"                        power loss, never corrupts)\n"
 "  -f, --force           backup: overwrite an existing destination\n",
     sdb_version_string());
     return 0;

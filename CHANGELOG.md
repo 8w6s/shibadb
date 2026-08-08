@@ -11,6 +11,16 @@ Performance and durability hardening on top of the `v1.0.0-rc*` line. The
 C ABI and on-disk format remain frozen at v1.0.
 
 ### Performance
+- **Opt-in relaxed durability (`SDB_SYNCHRONOUS_NORMAL`).** A new `synchronous`
+  field on `sdb_database_options` (default `SDB_SYNCHRONOUS_FULL`, unchanged
+  behaviour) lets auto-commits acknowledge after the WAL pwrite but before the
+  fsync, folding durability into the next checkpoint — ~4x higher single-thread
+  auto-commit throughput. Checkpoint fsyncs the WAL before copying frames into
+  the data file, so the write-ahead invariant holds: a power loss can only drop
+  the newest un-checkpointed commits, never corrupt the database, and acked
+  commits still survive a process crash. Explicit transactions stay fully
+  durable regardless. Carved from the reserved block (ABI/`sizeof` unchanged);
+  exposed via the C option and the CLI `--synchronous full|normal` flag.
 - **Persistent WAL file descriptor + single-fsync commit (R2a).** The WAL
   is no longer opened/truncated/parent-dir-synced on every commit; the fd
   stays open and a commit issues a single fsync barrier. Checkpoint reads
