@@ -32,6 +32,10 @@ typedef struct sdb_database sdb_database;
 
 typedef struct sdb_transaction sdb_transaction;
 
+/* Commit durability modes for sdb_database_options.synchronous. */
+#define SDB_SYNCHRONOUS_FULL 0U
+#define SDB_SYNCHRONOUS_NORMAL 1U
+
 typedef struct sdb_database_options {
 
     uint32_t struct_size;
@@ -52,7 +56,27 @@ typedef struct sdb_database_options {
      */
     uint64_t cache_bytes;
 
-    uint64_t reserved[3];
+    /*
+     * Commit durability mode (0 = default). Claimed from the reserved block
+     * like cache_bytes above, so sizeof and every prior offset are unchanged
+     * and old callers read back 0 == SDB_SYNCHRONOUS_FULL.
+     *
+     *   SDB_SYNCHRONOUS_FULL   (0): every auto-commit fsyncs the WAL before it
+     *                               is acknowledged — durable across power loss.
+     *   SDB_SYNCHRONOUS_NORMAL (1): auto-commits are acknowledged after the WAL
+     *                               pwrite but before fsync; durability is
+     *                               folded into the next checkpoint. Commits
+     *                               survive a process crash (bytes are in the OS
+     *                               page cache) but the most recent ones may be
+     *                               lost on sudden power loss. Either way there
+     *                               is no corruption — checkpoint fsyncs the WAL
+     *                               before copying frames into the data file, so
+     *                               recovery discards any torn tail. Explicit
+     *                               transactions stay fully durable regardless.
+     */
+    uint64_t synchronous;
+
+    uint64_t reserved[2];
 } sdb_database_options;
 
 typedef struct sdb_index_term {

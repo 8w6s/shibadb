@@ -1211,6 +1211,9 @@ static sdb_status sdb_database_options_validate(
             return SDB_E_INVALID_ARGUMENT;
         }
     }
+    if (options->synchronous > SDB_SYNCHRONOUS_NORMAL) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
     if (options->password_size != 0U
         && (options->kdf_iterations < SDB_MIN_KDF_ITERATIONS
             || options->kdf_iterations > SDB_MAX_KDF_ITERATIONS)) {
@@ -1297,6 +1300,12 @@ sdb_status sdb_database_create(
     sdb_secure_zero(file_id, sizeof(file_id));
     if (status == SDB_OK) {
         status = sdb_btree_create(&database->pager, &database->tree);
+    }
+    if (status == SDB_OK) {
+        sdb_pager_set_sync_relaxed(
+            &database->pager,
+            options->synchronous == SDB_SYNCHRONOUS_NORMAL
+        );
     }
     if (status == SDB_OK) {
         status = sdb_engine_seed_generation(database);
@@ -1424,6 +1433,12 @@ static sdb_status sdb_database_open_internal(
     }
     if (status == SDB_OK) {
         status = sdb_btree_open(&database->pager, &database->tree);
+    }
+    if (status == SDB_OK) {
+        sdb_pager_set_sync_relaxed(
+            &database->pager,
+            options->synchronous == SDB_SYNCHRONOUS_NORMAL
+        );
     }
     if (status == SDB_OK) {
         status = sdb_engine_seed_generation(database);

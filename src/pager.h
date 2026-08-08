@@ -87,6 +87,9 @@ typedef struct sdb_pager {
     bool commit_failed;
     bool commit_coord_ready;
     bool defer_commit;
+    /* SDB_SYNCHRONOUS_NORMAL: group-commit acks after WAL pwrite, skipping the
+     * per-commit fsync (durability folds into the next checkpoint). */
+    bool sync_relaxed;
     bool pending_valid;
     uint64_t pending_txn_id;
     bool open;
@@ -248,6 +251,7 @@ void sdb_txn_abort(sdb_txn *txn);
  *   leader can be mid-fsync against the WAL being truncated.
  */
 void sdb_pager_set_defer_commit(sdb_pager *pager, bool defer);
+void sdb_pager_set_sync_relaxed(sdb_pager *pager, bool relaxed);
 bool sdb_pager_take_pending(sdb_pager *pager, uint64_t *txn_id_out);
 sdb_status sdb_pager_commit_durable(sdb_pager *pager, uint64_t txn_id);
 sdb_status sdb_pager_group_checkpoint_if_due(sdb_pager *pager);
