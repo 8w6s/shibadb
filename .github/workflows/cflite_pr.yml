@@ -1,0 +1,49 @@
+name: ClusterFuzzLite PR fuzzing
+
+# Runs the fuzz targets for a short budget on every pull request, focused on
+# the code the PR changes (mode: code-change). This is the continuous-fuzzing
+# layer the project previously lacked: the .clusterfuzzlite/ config existed but
+# no workflow ever invoked it, so only static corpus replay ran. Here libFuzzer
+# actually generates new inputs under ASan and UBSan and fails the PR on any
+# crash, leak, or undefined behaviour it discovers.
+#
+# Seed corpora ship in fuzz/corpus-*; a dedicated corpus-storage repo is not
+# configured, so inputs are not accumulated across runs. Add `storage-repo`
+# (and a batch/cron workflow) later to grow corpora and run longer campaigns —
+# that requires the owner to create a storage repo + token, so it is left as a
+# follow-up rather than wired here.
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions: read-all
+
+jobs:
+  PR:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cflite-pr-${{ matrix.sanitizer }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - address
+          - undefined
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: c
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: code-change
+          sanitizer: ${{ matrix.sanitizer }}
