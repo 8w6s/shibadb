@@ -1,5 +1,8 @@
 #include "crypto.h"
 
+#include "chacha_simd.h"
+#include "cpu_features.h"
+
 #include <string.h>
 
 typedef struct sdb_poly1305 {
@@ -129,6 +132,17 @@ static void sdb_chacha_xor(
 )
 {
     uint8_t block[64];
+#if SDB_CPU_X86
+    if (size >= 512U && sdb_cpu_features_get()->avx2) {
+        const size_t groups = size / 512U;
+        const size_t bytes = groups * 512U;
+        sdb_chacha8_xor(key, nonce, counter, input, output, groups);
+        counter += (uint32_t)(groups * 8U);
+        input += bytes;
+        output += bytes;
+        size -= bytes;
+    }
+#endif
     while (size != 0U) {
         const size_t take = size < sizeof(block) ? size : sizeof(block);
         size_t index;
