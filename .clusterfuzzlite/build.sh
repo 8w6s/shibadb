@@ -21,10 +21,16 @@ cmake -S . -B build-oss-fuzz -G Ninja \
 
 cmake --build build-oss-fuzz --parallel "$(nproc)"
 
-# Copy fuzz target binaries into $OUT and pair each with its seed corpus
-# (if the corpus directory exists) as required by OSS-Fuzz.
-for target in fuzz_superblock fuzz_page fuzz_btree_page fuzz_xchacha20poly1305; do
-    cp "build-oss-fuzz/${target}" "$OUT/${target}"
+# Copy every built fuzz target binary into $OUT and pair each with its seed
+# corpus (if the corpus directory exists) as required by OSS-Fuzz. Globbing the
+# built binaries — rather than hard-coding a subset — guarantees all targets
+# defined in CMake (SDB_FUZZ_TARGETS) get deployed, including wal_recover,
+# encrypted_envelope, and pager_open (the highest-value storage/decrypt paths),
+# and picks up any target added later without editing this script.
+for target_path in build-oss-fuzz/fuzz_*; do
+    [ -x "$target_path" ] || continue
+    target="$(basename "$target_path")"
+    cp "$target_path" "$OUT/${target}"
     corpus_dir="fuzz/corpus-${target#fuzz_}"
     if [ -d "$corpus_dir" ]; then
         (cd "$corpus_dir" && zip -qr "$OUT/${target}_seed_corpus.zip" .)

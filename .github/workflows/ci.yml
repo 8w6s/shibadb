@@ -73,7 +73,7 @@ jobs:
         run: ctest --test-dir build-tsan --output-on-failure --timeout 600
 
   fuzz-smoke:
-    name: Fuzz smoke (replay corpus)
+    name: Fuzz smoke (replay + short fuzz)
     runs-on: ubuntu-latest
     env:
       CC: clang
@@ -83,13 +83,28 @@ jobs:
         run: cmake --preset fuzz
       - name: Build
         run: cmake --build --preset fuzz --parallel
-      - name: Replay corpus through each harness
+      - name: Replay corpus and short-fuzz each harness
         run: |
           set -e
           for harness in superblock page btree_page xchacha20poly1305 \
                          encrypted_envelope wal_recover pager_open; do
             echo "== fuzz_$harness =="
-            ./build-fuzz/fuzz_$harness fuzz/corpus-$harness -runs=0
+            corpus="fuzz/corpus-$harness"
+            # A corpus that is missing or empty makes `-runs=0` "pass" without
+            # executing a single input, silently hiding loss of coverage. Fail
+            # loudly instead.
+            if [ ! -d "$corpus" ] || [ -z "$(ls -A "$corpus" 2>/dev/null)" ]; then
+              echo "::error::seed corpus $corpus is missing or empty"
+              exit 1
+            fi
+            # 1) Replay the seed corpus (regression check on known inputs).
+            ./build-fuzz/fuzz_$harness "$corpus" -runs=0
+            # 2) Actually fuzz for a short budget so NEW inputs are generated
+            #    every push — this is what catches a regression a change
+            #    introduces, which pure -runs=0 replay cannot. A crash makes
+            #    libFuzzer exit non-zero and fails the job.
+            ./build-fuzz/fuzz_$harness "$corpus" \
+              -max_total_time=30 -print_final_stats=1
           done
 
   native-portability:
