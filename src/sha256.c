@@ -1,9 +1,12 @@
 #include "crypto.h"
 
+#include "cpu_features.h"
+#include "sha256_simd.h"
+
 #include <stdlib.h>
 #include <string.h>
 
-static const uint32_t sdb_sha256_constants[64] = {
+const uint32_t sdb_sha256_constants[64] = {
     UINT32_C(0x428a2f98), UINT32_C(0x71374491), UINT32_C(0xb5c0fbcf),
     UINT32_C(0xe9b5dba5), UINT32_C(0x3956c25b), UINT32_C(0x59f111f1),
     UINT32_C(0x923f82a4), UINT32_C(0xab1c5ed5), UINT32_C(0xd807aa98),
@@ -49,7 +52,7 @@ static void sdb_write_u32_be(uint8_t *output, uint32_t value)
     output[3] = (uint8_t)value;
 }
 
-static void sdb_sha256_transform(
+static void sdb_sha256_transform_scalar(
     sdb_sha256_context *context, const uint8_t block[64]
 )
 {
@@ -114,6 +117,20 @@ static void sdb_sha256_transform(
     context->state[6] += g;
     context->state[7] += h;
     sdb_secure_zero(schedule, sizeof(schedule));
+}
+
+static void sdb_sha256_transform(
+    sdb_sha256_context *context, const uint8_t block[64]
+)
+{
+#if SDB_CPU_X86
+    const sdb_cpu_features *cpu = sdb_cpu_features_get();
+    if (cpu->sha && cpu->sse41) {
+        sdb_sha256_transform_shani(context, block);
+        return;
+    }
+#endif
+    sdb_sha256_transform_scalar(context, block);
 }
 
 void sdb_sha256_init(sdb_sha256_context *context)

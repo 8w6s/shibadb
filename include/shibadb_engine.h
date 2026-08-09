@@ -36,6 +36,14 @@ typedef struct sdb_transaction sdb_transaction;
 #define SDB_SYNCHRONOUS_FULL 0U
 #define SDB_SYNCHRONOUS_NORMAL 1U
 
+/*
+ * Sentinel for sdb_database_options.cache_bytes: size the page cache
+ * automatically from the machine's physical RAM (a bounded fraction, clamped
+ * to a sane floor/ceiling) instead of the small fixed default. Use when the
+ * database is the primary consumer of a box with plenty of RAM.
+ */
+#define SDB_CACHE_AUTO ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
+
 typedef struct sdb_database_options {
 
     uint32_t struct_size;

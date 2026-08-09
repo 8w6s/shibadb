@@ -32,8 +32,10 @@ endif()
 set(SHIBADB_SOURCES
     src/btree.c
     src/btree_page.c
+    src/chacha_avx2.c
     src/checksum.c
     src/codec.c
+    src/cpu_features.c
     src/encrypted_page.c
     src/engine.c
     src/engine_convenience.c
@@ -45,10 +47,12 @@ set(SHIBADB_SOURCES
     src/random.c
     src/replace.c
     src/sha256.c
+    src/sha256_shani.c
     src/status.c
     src/superblock.c
     src/superblock_store.c
     src/sync.c
+    src/sysinfo.c
     src/wal.c
     src/wal_index.c
     src/windows_path.c
@@ -198,6 +202,44 @@ if(MSVC)
     set_target_properties(shibadb_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 else()
     set_target_properties(shibadb_core PROPERTIES C_VISIBILITY_PRESET hidden)
+endif()
+
+# The SHA-NI kernel needs SHA + SSE4.1 (SSSE3) enabled for just this one file
+# on GCC/Clang; the rest of the tree stays at baseline ISA so the binary still
+# runs on CPUs without those extensions. Runtime entry is gated by
+# sdb_cpu_features_get()->sha, so the instructions never execute unsupported.
+# MSVC emits these intrinsics with no special /arch flag.
+if(NOT MSVC)
+    set_source_files_properties(src/sha256_shani.c PROPERTIES
+        COMPILE_OPTIONS "-msse4.1;-msha")
+    set_source_files_properties(src/chacha_avx2.c PROPERTIES
+        COMPILE_OPTIONS "-mavx2")
+else()
+    # MSVC gates AVX2 intrinsics behind /arch:AVX2 (unlike the SHA intrinsics,
+    # which it emits unconditionally). Applied to just this file so the rest of
+    # the tree keeps its baseline ISA; runtime entry is gated by ->avx2.
+    set_source_files_properties(src/chacha_avx2.c PROPERTIES
+        COMPILE_OPTIONS "/arch:AVX2")
+endif()
+
+# Link-time / interprocedural optimization for optimized builds. Enables
+# whole-program optimization across translation units (GCC/Clang -flto, MSVC
+# /GL + /LTCG), which matters for the hot crypto/pager/btree paths that call
+# across file boundaries. Guarded on toolchain support and an optimized build
+# type so Debug/coverage builds stay fast and debuggable, and disabled under
+# sanitizer/fuzzer builds where it interferes with instrumentation.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT sdb_ipo_supported OUTPUT sdb_ipo_output LANGUAGES C)
+if(sdb_ipo_supported
+   AND CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$"
+   AND NOT SDB_ENABLE_SANITIZERS
+   AND NOT SDB_ENABLE_THREAD_SANITIZER
+   AND NOT SDB_ENABLE_FUZZERS)
+    set_target_properties(shibadb_core shibadb_shared PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION TRUE)
+    message(STATUS "ShibaDB: IPO/LTO enabled for optimized build")
+elseif(NOT sdb_ipo_supported)
+    message(STATUS "ShibaDB: IPO/LTO unavailable: ${sdb_ipo_output}")
 endif()
 
 install(
@@ -405,6 +447,18 @@ if(SDB_BUILD_TESTS)
     add_executable(test_crypto tests/test_crypto.c)
     target_include_directories(test_crypto PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_crypto PRIVATE ShibaDB::core)
+    add_executable(test_sha256_simd tests/test_sha256_simd.c)
+    target_include_directories(test_sha256_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_sha256_simd PRIVATE ShibaDB::core)
+    add_executable(test_crc32_simd tests/test_crc32_simd.c)
+    target_include_directories(test_crc32_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_crc32_simd PRIVATE ShibaDB::core)
+    add_executable(test_chacha_simd tests/test_chacha_simd.c)
+    target_include_directories(test_chacha_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_chacha_simd PRIVATE ShibaDB::core)
+    add_executable(test_cache_auto tests/test_cache_auto.c)
+    target_include_directories(test_cache_auto PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_cache_auto PRIVATE ShibaDB::core)
     add_executable(test_encryption tests/test_encryption.c)
     target_include_directories(test_encryption PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_encryption PRIVATE ShibaDB::core)
@@ -525,6 +579,10 @@ if(SDB_BUILD_TESTS)
         target_compile_options(test_btree_reclaim_overflow PRIVATE /W4 /WX)
         target_compile_options(test_txn_cancel_alloc PRIVATE /W4 /WX)
         target_compile_options(test_crypto PRIVATE /W4 /WX)
+        target_compile_options(test_sha256_simd PRIVATE /W4 /WX)
+        target_compile_options(test_crc32_simd PRIVATE /W4 /WX)
+        target_compile_options(test_chacha_simd PRIVATE /W4 /WX)
+        target_compile_options(test_cache_auto PRIVATE /W4 /WX)
         target_compile_options(test_encryption PRIVATE /W4 /WX)
         target_compile_options(test_encryption_fault PRIVATE /W4 /WX)
         target_compile_options(test_engine PRIVATE /W4 /WX)
@@ -622,6 +680,18 @@ if(SDB_BUILD_TESTS)
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
         )
         target_compile_options(test_crypto PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+        target_compile_options(test_sha256_simd PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+        target_compile_options(test_crc32_simd PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+        target_compile_options(test_chacha_simd PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+        target_compile_options(test_cache_auto PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
         )
         target_compile_options(test_encryption PRIVATE
@@ -723,6 +793,10 @@ if(SDB_BUILD_TESTS)
     add_test(NAME btree_reclaim_overflow COMMAND test_btree_reclaim_overflow)
     add_test(NAME txn_cancel_alloc COMMAND test_txn_cancel_alloc)
     add_test(NAME crypto COMMAND test_crypto)
+    add_test(NAME sha256_simd COMMAND test_sha256_simd)
+    add_test(NAME crc32_simd COMMAND test_crc32_simd)
+    add_test(NAME chacha_simd COMMAND test_chacha_simd)
+    add_test(NAME cache_auto COMMAND test_cache_auto)
     add_test(NAME encryption COMMAND test_encryption)
     add_test(NAME encryption_fault COMMAND test_encryption_fault)
     add_test(NAME engine COMMAND test_engine)
@@ -844,6 +918,11 @@ if(SDB_BUILD_BENCHMARKS)
     target_link_libraries(bench_kv PRIVATE ShibaDB::core)
     add_executable(bench_churn benchmarks/bench_churn.c)
     target_link_libraries(bench_churn PRIVATE ShibaDB::core)
+    # Component micro-benchmark reaches internal crypto/checksum symbols, so it
+    # links the static core and needs the private src/ include path.
+    add_executable(bench_crypto benchmarks/bench_crypto.c)
+    target_link_libraries(bench_crypto PRIVATE ShibaDB::core)
+    target_include_directories(bench_crypto PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     find_package(Threads REQUIRED)
     add_executable(bench_concurrent benchmarks/bench_concurrent.c)
     target_link_libraries(
@@ -852,12 +931,16 @@ if(SDB_BUILD_BENCHMARKS)
     if(MSVC)
         target_compile_options(bench_kv PRIVATE /W4 /WX)
         target_compile_options(bench_churn PRIVATE /W4 /WX)
+        target_compile_options(bench_crypto PRIVATE /W4 /WX)
         target_compile_options(bench_concurrent PRIVATE /W4 /WX)
     else()
         target_compile_options(bench_kv PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
         )
         target_compile_options(bench_churn PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
+        )
+        target_compile_options(bench_crypto PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
         )
         target_compile_options(bench_concurrent PRIVATE

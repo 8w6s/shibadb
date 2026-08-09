@@ -6,10 +6,38 @@
 #include "internal.h"
 #include "replace.h"
 #include "sync.h"
+#include "sysinfo.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Resolve the caller's cache_bytes request into a byte budget for the pager.
+ * SDB_CACHE_AUTO picks 25% of physical RAM, clamped to [4 MiB, 1 GiB] so the
+ * automatic default never balloons (the pager clamps again to its page-count
+ * ceiling). Any other value — including 0, the engine default — passes through
+ * unchanged. An unknown RAM size falls back to the engine default. */
+static size_t sdb_engine_resolve_cache_bytes(uint64_t requested)
+{
+    const uint64_t floor_bytes = (uint64_t)4U * 1024U * 1024U;
+    const uint64_t ceil_bytes = (uint64_t)1024U * 1024U * 1024U;
+    uint64_t ram;
+    uint64_t budget;
+    if (requested != SDB_CACHE_AUTO) {
+        return (size_t)requested;
+    }
+    ram = sdb_physical_memory_bytes();
+    if (ram == 0U) {
+        return 0U;
+    }
+    budget = ram / 4U;
+    if (budget < floor_bytes) {
+        budget = floor_bytes;
+    } else if (budget > ceil_bytes) {
+        budget = ceil_bytes;
+    }
+    return (size_t)budget;
+}
 
 #if defined(_WIN32) && SDB_TESTING
 #define SDB_WINDOWS_TEST_DIAG(stage_, status_) \
@@ -1278,7 +1306,7 @@ sdb_status sdb_database_create(
             options->password,
             options->password_size,
             options->kdf_iterations,
-            (size_t)options->cache_bytes,
+            sdb_engine_resolve_cache_bytes(options->cache_bytes),
             &database->pager
         );
     } else if (status == SDB_OK) {
@@ -1287,7 +1315,7 @@ sdb_status sdb_database_create(
             options->page_size,
             salt,
             file_id,
-            (size_t)options->cache_bytes,
+            sdb_engine_resolve_cache_bytes(options->cache_bytes),
             &database->pager
         );
     }
@@ -1419,14 +1447,14 @@ static sdb_status sdb_database_open_internal(
                 database->path,
                 options->password,
                 options->password_size,
-                (size_t)options->cache_bytes,
+                sdb_engine_resolve_cache_bytes(options->cache_bytes),
                 &database->pager
             );
     } else {
         status = options->password_size == 0U
             ? sdb_pager_open_ex(
                   database->path,
-                  (size_t)options->cache_bytes,
+                  sdb_engine_resolve_cache_bytes(options->cache_bytes),
                   &database->pager
               )
             : SDB_E_INVALID_ARGUMENT;
