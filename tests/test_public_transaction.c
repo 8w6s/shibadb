@@ -332,6 +332,8 @@ static void test_poison_partial_inplace_delete(sdb_database *database)
     sdb_engine_chunk_key_clear_failure_for_testing();
     commit_status = sdb_transaction_commit(transaction);
     assert(commit_status != SDB_OK);
+    /* commit/rollback leave the handle allocated; close frees it. */
+    assert(sdb_transaction_close(transaction) == SDB_OK);
 }
 
 int main(void)

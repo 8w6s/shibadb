@@ -16,6 +16,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #endif
 
@@ -192,9 +193,24 @@ static void test_compact_races_commit(void)
         } else {
             ++compact_busy;
         }
-        if (workers_done) {
+        /*
+         * Stop as soon as the guard is proven exercised (a BUSY was observed)
+         * or the workers have all finished. Breaking on the first BUSY is what
+         * this test needs — it does not require draining the whole worker
+         * lifetime — and it keeps the loop from busy-spinning compaction for
+         * the entire (very long under ASan/TSan) run, which otherwise pushed
+         * the test past its per-test timeout. Yield between attempts so the
+         * committing workers get the CPU and a commit reliably lands in flight
+         * while a compaction is trying, instead of this thread starving them.
+         */
+        if (workers_done || compact_busy > 0U) {
             break;
         }
+#ifdef _WIN32
+        (void)SwitchToThread();
+#else
+        sched_yield();
+#endif
     }
     for (index = 0U; index < THREAD_COUNT; ++index) {
 #ifdef _WIN32
