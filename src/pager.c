@@ -1028,9 +1028,18 @@ sdb_status sdb_pager_rotate_password(
     return status;
 }
 
-sdb_status sdb_pager_write(
+/*
+ * Core page writer, factored out of sdb_pager_write so sdb_pager_allocate can
+ * write a freshly-grown page image at its computed offset BEFORE the superblock
+ * publishes the incremented next_page_id (write-then-publish, invariant A.2).
+ * The caller supplies the already-validated offset; this routine performs no
+ * next_page_id guard, so it must only be reached with an offset the caller has
+ * bounds-checked via sdb_pager_offset.
+ */
+static sdb_status sdb_pager_write_core(
     sdb_pager *pager,
     uint64_t page_id,
+    uint64_t offset,
     uint16_t type,
     uint64_t page_lsn,
     const uint8_t *payload,
@@ -1038,17 +1047,7 @@ sdb_status sdb_pager_write(
 )
 {
     uint8_t *page;
-    uint64_t offset;
     sdb_status status;
-    if (pager == NULL || !pager->open || pager->needs_recovery
-        || pager->transaction_active
-        || page_id == 0U || page_id >= pager->superblock.next_page_id) {
-        return SDB_E_INVALID_ARGUMENT;
-    }
-    status = sdb_pager_offset(pager, page_id, &offset);
-    if (status != SDB_OK) {
-        return status;
-    }
     page = (uint8_t *)malloc((size_t)pager->superblock.page_size);
     if (page == NULL) {
         return SDB_E_OUT_OF_MEMORY;
@@ -1118,6 +1117,31 @@ sdb_status sdb_pager_write(
     }
     free(page);
     return status;
+}
+
+sdb_status sdb_pager_write(
+    sdb_pager *pager,
+    uint64_t page_id,
+    uint16_t type,
+    uint64_t page_lsn,
+    const uint8_t *payload,
+    size_t payload_size
+)
+{
+    uint64_t offset;
+    sdb_status status;
+    if (pager == NULL || !pager->open || pager->needs_recovery
+        || pager->transaction_active
+        || page_id == 0U || page_id >= pager->superblock.next_page_id) {
+        return SDB_E_INVALID_ARGUMENT;
+    }
+    status = sdb_pager_offset(pager, page_id, &offset);
+    if (status != SDB_OK) {
+        return status;
+    }
+    return sdb_pager_write_core(
+        pager, page_id, offset, type, page_lsn, payload, payload_size
+    );
 }
 
 sdb_status sdb_pager_read(
@@ -1339,7 +1363,38 @@ sdb_status sdb_pager_allocate(sdb_pager *pager, uint64_t *page_id_out)
         if (status != SDB_OK) {
             return status;
         }
+        /*
+         * Write-then-publish (invariant A.2): initialize the freshly grown page
+         * image BEFORE advancing next_page_id. If the process crashes after the
+         * resize/write but before the superblock advance, the page sits in the
+         * trailing region past the still-old next_page_id, which
+         * sdb_pager_canonicalize_file_size reclaims on the next open — no
+         * uninitialized orphan is left inside the committed page range.
+         * next_page_id is published only once the page write and its fsync
+         * have succeeded.
+         */
+        status = sdb_generation_bump(&next.generation);
+        if (status != SDB_OK) {
+            return status;
+        }
+        status = sdb_pager_write_core(
+            pager,
+            page_id,
+            offset,
+            (uint16_t)SDB_PAGE_TYPE_DATA,
+            next.generation,
+            NULL,
+            0U
+        );
+        if (status != SDB_OK) {
+            return status;
+        }
         next.next_page_id = page_id + 1U;
+        status = sdb_pager_store_superblock(pager, &next);
+        if (status == SDB_OK) {
+            *page_id_out = page_id;
+        }
+        return status;
     }
     status = sdb_generation_bump(&next.generation);
     if (status != SDB_OK) {

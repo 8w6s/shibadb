@@ -26,9 +26,15 @@ page and the original root page becomes an internal node. This makes root
 splits part of the same atomic multi-page WAL transaction without changing the
 superblock root pointer.
 
-Deletion removes leaf entries but intentionally leaves empty pages and stable
-separator boundaries in place. This preserves lookup and cursor correctness;
-space reclamation is assigned to the compaction milestone.
+Deletion removes leaf entries in place. A leaf that becomes completely empty is
+reclaimed within the same WAL transaction: its linked-list predecessor is
+relinked past it, its separator is removed from the parent, and the page is
+freed. An internal node then left with a single child collapses upward, and an
+empty path reaching the root collapses the tree's height through the stable
+root page. Non-empty leaves are never merged or redistributed on underflow, so
+a sparsely-filled leaf keeps its separator boundaries in place — this preserves
+lookup and cursor correctness. Reclaiming that residual slack (compacting
+sparse-but-live leaves) is assigned to the compaction milestone.
 
 ## Sizing invariants
 

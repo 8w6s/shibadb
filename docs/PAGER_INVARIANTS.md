@@ -74,35 +74,41 @@ public `sdb_pager_allocate` and `sdb_pager_free` refuse to run while
 `transaction_active` is set (`src/pager.c:563, 639`), so they can never
 overlap with a transaction whose atomicity the WAL protects.
 
-**A.2** — `sdb_pager_allocate` publishes the incremented `next_page_id`
-in the superblock **before** it writes the initial page image
-(`src/pager.c:614-624`). A crash between the superblock advance and the
-initial-page write therefore leaves a physical page whose id is within
-the committed `next_page_id` but whose on-disk content is uninitialized
-(zero-extended by `ftruncate`) or partial. This is a known bounded
-crash window with the following scope:
+**A.2** — `sdb_pager_allocate` has two paths, with different crash
+orderings:
+
+- **Grow path** (no free page available): the routine grows the file,
+  writes the initial page image via `sdb_pager_write_core`, and only
+  then publishes the incremented `next_page_id` in the superblock
+  (write-then-publish). A crash before the superblock advance leaves the
+  freshly written page in the trailing region *past* the still-old
+  `next_page_id`, which `sdb_pager_canonicalize_file_size` reclaims on
+  the next open — so no uninitialized page is ever left *inside* the
+  committed `[1, next_page_id)` range. `sdb_pager_write_core` exists to
+  perform this write without the `page_id < next_page_id` guard that the
+  public `sdb_pager_write` enforces.
+- **Free-list path** (reusing a freed page): the routine pops the free
+  list head into the superblock **before** it overwrites the reused page
+  with its `DATA` image (publish-then-write). This ordering is
+  deliberate: writing the `DATA` image first would, on a crash before
+  the pop is durable, leave the free-list head pointing at a page that
+  no longer decodes as `SDB_PAGE_TYPE_FREE`, corrupting the free list on
+  the next allocate. The current ordering instead risks only a single
+  leaked page (popped from the free list but not yet re-initialized) in
+  that crash window — a bounded space leak, never a corrupt free list.
+
+Both windows have a narrow blast radius:
 
 - The **only** production caller of `sdb_pager_allocate` outside of a
-  transaction is `sdb_btree_create` (`src/btree.c:800`), which itself is
-  only called from `sdb_database_create` (`src/engine.c:939`). A crash
-  in the window therefore only affects database creation, before any
-  application data has been written.
-- After such a crash, `sdb_database_create` never returned success, so
-  no caller ever received a handle to the partially-created database.
-  The subsequent recovery path (open the created file, decode the
-  advanced superblock, then attempt to decode the never-written root
-  page) will fail with `SDB_E_CORRUPT` because `sdb_page_decode` sees
-  no magic. The operator must remove the partial file and retry create.
+  transaction is `sdb_btree_create`, itself only reached from
+  `sdb_database_create`. A crash therefore only affects database
+  creation, before any application data has been written, and
+  `sdb_database_create` never returned success — no caller ever received
+  a handle to the partially-created database.
 - **No runtime data path is affected.** Every runtime allocation goes
   through `sdb_txn_allocate` and is bundled into the WAL commit of its
   transaction (T.3), so the WAL either replays the entire allocation
   plus its initialization or replays neither.
-
-A future hardening step could reorder `sdb_pager_allocate` to
-write-then-publish, but doing so requires either an internal write path
-that bypasses the `page_id < next_page_id` guard on the public
-`sdb_pager_write` or a rework of that check. The current ordering is
-retained until that refactor is undertaken.
 
 **A.3** — `sdb_pager_free` writes the target page as `SDB_PAGE_TYPE_FREE`
 (with the previous freelist head chained in its payload) **before**
