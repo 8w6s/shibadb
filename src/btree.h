@@ -24,6 +24,16 @@ typedef struct sdb_btree_batch {
     sdb_txn txn;
     sdb_status failure;
     bool active;
+    /*
+     * Monotonic count of stage operations (both new-page appends and in-place
+     * re-stages of an already-present page). Unlike `count`, which tracks only
+     * distinct pages, this ticks on every mutation, so a caller can detect that
+     * an operation staged SOMETHING even when it only rewrote a page already in
+     * the batch. The engine's poison-on-partial guard keys off this so that an
+     * op which mutates a staged page in place and then fails on a non-batch
+     * path (e.g. a key-build allocation) still poisons the batch.
+     */
+    uint64_t revision;
 } sdb_btree_batch;
 
 /*

@@ -493,6 +493,7 @@ if(SDB_BUILD_TESTS)
     )
     shibadb_configure_target(test_object_metadata_bound)
     add_executable(test_public_transaction tests/test_public_transaction.c)
+    target_include_directories(test_public_transaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_public_transaction PRIVATE ShibaDB::core)
     add_executable(
         test_public_transaction_property
