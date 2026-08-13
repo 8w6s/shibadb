@@ -4777,6 +4777,9 @@ sdb_status sdb_database_info(
     result_out->generation = superblock->generation;
     result_out->checkpoint_lsn = superblock->checkpoint_lsn;
     result_out->page_count = superblock->next_page_id;
+    result_out->wal_size_bytes = database->pager.wal_tail;
+    result_out->checkpoint_threshold_bytes = database->pager.checkpoint_threshold;
+    result_out->freelist_head_page = superblock->freelist_page;
     sdb_mutex_unlock(&database->mutex);
     return SDB_OK;
 }

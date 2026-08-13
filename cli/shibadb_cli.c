@@ -470,6 +470,10 @@ static int cmd_health(const char *path, const cli_options *opts) {
     printf("generation:     %" PRIu64 "\n", info.generation);
     printf("checkpoint_lsn: %" PRIu64 "\n", info.checkpoint_lsn);
     printf("page_count:     %" PRIu64 "\n", info.page_count);
+    printf("wal_size_bytes: %" PRIu64 "\n", info.wal_size_bytes);
+    printf("checkpoint_threshold_bytes: %" PRIu64 "\n",
+           info.checkpoint_threshold_bytes);
+    printf("freelist_head_page: %" PRIu64 "\n", info.freelist_head_page);
     printf("health: OK\n");
     return 0;
 }

@@ -10,6 +10,10 @@ from typing import Callable, Iterable, Sequence
 __version__ = "0.1.0"
 ABI_VERSION = 1
 
+SDB_SYNCHRONOUS_FULL = 0
+SDB_SYNCHRONOUS_NORMAL = 1
+SDB_CACHE_AUTO = 0xFFFFFFFFFFFFFFFF
+
 _u8 = ctypes.c_uint8
 _u8_p = ctypes.POINTER(_u8)
 _database_p = ctypes.c_void_p
@@ -43,7 +47,9 @@ class _Options(ctypes.Structure):
         ("kdf_iterations", ctypes.c_uint32),
         ("password", _u8_p),
         ("password_size", ctypes.c_size_t),
-        ("reserved", ctypes.c_uint64 * 4),
+        ("cache_bytes", ctypes.c_uint64),
+        ("synchronous", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 2),
     ]
 
 class _IndexTerm(ctypes.Structure):
@@ -82,6 +88,19 @@ class _CompactResult(ctypes.Structure):
         ("byte_count_after", ctypes.c_uint64),
         ("raw_entries_before", ctypes.c_uint64),
         ("raw_entries_after", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 4),
+    ]
+
+class _InfoResult(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("page_size", ctypes.c_uint32),
+        ("encrypted", ctypes.c_bool),
+        ("reserved_alignment", ctypes.c_uint8 * 3),
+        ("kdf_iterations", ctypes.c_uint32),
+        ("generation", ctypes.c_uint64),
+        ("checkpoint_lsn", ctypes.c_uint64),
+        ("page_count", ctypes.c_uint64),
         ("reserved", ctypes.c_uint64 * 4),
     ]
 
@@ -268,6 +287,39 @@ _lib.sdb_database_migrate_file.argtypes = [
     ctypes.POINTER(_CompactResult),
 ]
 _lib.sdb_database_migrate_file.restype = ctypes.c_int
+_lib.sdb_database_info.argtypes = [
+    _database_p, ctypes.POINTER(_InfoResult)
+]
+_lib.sdb_database_info.restype = ctypes.c_int
+_lib.sdb_kv_exists.argtypes = [
+    _database_p, _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_bool),
+]
+_lib.sdb_kv_exists.restype = ctypes.c_int
+_lib.sdb_kv_count.argtypes = [
+    _database_p, _u8_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
+]
+_lib.sdb_kv_count.restype = ctypes.c_int
+_lib.sdb_kv_count_prefix.argtypes = [
+    _database_p, _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint64),
+]
+_lib.sdb_kv_count_prefix.restype = ctypes.c_int
+_lib.sdb_kv_put_if_absent.argtypes = [
+    _database_p, _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
+    _u8_p, ctypes.c_size_t,
+]
+_lib.sdb_kv_put_if_absent.restype = ctypes.c_int
+_lib.sdb_kv_compare_and_swap.argtypes = [
+    _database_p, _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
+    _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
+]
+_lib.sdb_kv_compare_and_swap.restype = ctypes.c_int
+_lib.sdb_kv_increment.argtypes = [
+    _database_p, _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
+    ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+]
+_lib.sdb_kv_increment.restype = ctypes.c_int
 
 def abi_version() -> int:
     return int(_lib.sdb_abi_version())
@@ -316,12 +368,18 @@ def _document_expired(document: dict, now: float) -> bool:
     ) and expires_at <= now
 
 def _options(
-    password: bytes | str | None, page_size: int, kdf_iterations: int
+    password: bytes | str | None,
+    page_size: int,
+    kdf_iterations: int,
+    cache_bytes: int = 0,
+    synchronous: int = SDB_SYNCHRONOUS_FULL,
 ) -> tuple[_Options, object | None]:
     options = _Options()
     _lib.sdb_database_options_init(ctypes.byref(options))
     options.page_size = page_size
     options.kdf_iterations = kdf_iterations
+    options.cache_bytes = cache_bytes
+    options.synchronous = synchronous
     password_bytes = b"" if password is None else _bytes(password)
     storage, pointer = _buffer(password_bytes)
     options.password = pointer
@@ -370,8 +428,12 @@ class Database:
         password: bytes | str | None = None,
         page_size: int = 4096,
         kdf_iterations: int = 600000,
+        cache_bytes: int = 0,
+        synchronous: int = SDB_SYNCHRONOUS_FULL,
     ) -> "Database":
-        options, keepalive = _options(password, page_size, kdf_iterations)
+        options, keepalive = _options(
+            password, page_size, kdf_iterations, cache_bytes, synchronous
+        )
         handle = _database_p()
         status = _lib.sdb_database_create(
             _path(path), ctypes.byref(options), ctypes.byref(handle)
@@ -388,8 +450,12 @@ class Database:
         password: bytes | str | None = None,
         page_size: int = 4096,
         kdf_iterations: int = 600000,
+        cache_bytes: int = 0,
+        synchronous: int = SDB_SYNCHRONOUS_FULL,
     ) -> "Database":
-        options, keepalive = _options(password, page_size, kdf_iterations)
+        options, keepalive = _options(
+            password, page_size, kdf_iterations, cache_bytes, synchronous
+        )
         handle = _database_p()
         status = _lib.sdb_database_open(
             _path(path), ctypes.byref(options), ctypes.byref(handle)
@@ -495,6 +561,127 @@ class Database:
 
     def delete_blob(self, namespace, key) -> None:
         self._delete("blob", namespace, key)
+
+    def exists(self, namespace, key) -> bool:
+        """True iff a KV key is present, without copying its value."""
+        namespace_bytes, key_bytes = map(_bytes, (namespace, key))
+        ns_store, ns_ptr = _buffer(namespace_bytes)
+        key_store, key_ptr = _buffer(key_bytes)
+        present = ctypes.c_bool()
+        status = _lib.sdb_kv_exists(
+            self._require_open(),
+            ns_ptr, len(namespace_bytes), key_ptr, len(key_bytes),
+            ctypes.byref(present),
+        )
+        del ns_store, key_store
+        _raise_status(status)
+        return bool(present.value)
+
+    def count(self, namespace) -> int:
+        """Count all keys in a KV namespace."""
+        namespace_bytes = _bytes(namespace)
+        ns_store, ns_ptr = _buffer(namespace_bytes)
+        total = ctypes.c_uint64()
+        status = _lib.sdb_kv_count(
+            self._require_open(),
+            ns_ptr, len(namespace_bytes), ctypes.byref(total),
+        )
+        del ns_store
+        _raise_status(status)
+        return int(total.value)
+
+    def count_prefix(self, namespace, prefix=b"") -> int:
+        """Count keys in a KV namespace whose key begins with prefix (an empty
+        prefix counts the whole namespace)."""
+        namespace_bytes, prefix_bytes = map(_bytes, (namespace, prefix))
+        ns_store, ns_ptr = _buffer(namespace_bytes)
+        prefix_store, prefix_ptr = _buffer(prefix_bytes)
+        total = ctypes.c_uint64()
+        status = _lib.sdb_kv_count_prefix(
+            self._require_open(),
+            ns_ptr, len(namespace_bytes), prefix_ptr, len(prefix_bytes),
+            ctypes.byref(total),
+        )
+        del ns_store, prefix_store
+        _raise_status(status)
+        return int(total.value)
+
+    def put_if_absent(self, namespace, key, value) -> bool:
+        """Atomically store value only if the key does not yet exist. Return
+        True if it was written, False if the key already existed."""
+        namespace_bytes, key_bytes, value_bytes = map(
+            _bytes, (namespace, key, value)
+        )
+        ns_store, ns_ptr = _buffer(namespace_bytes)
+        key_store, key_ptr = _buffer(key_bytes)
+        value_store, value_ptr = _buffer(value_bytes)
+        status = _lib.sdb_kv_put_if_absent(
+            self._require_open(),
+            ns_ptr, len(namespace_bytes), key_ptr, len(key_bytes),
+            value_ptr, len(value_bytes),
+        )
+        del ns_store, key_store, value_store
+        if status == 12:
+            return False
+        _raise_status(status)
+        return True
+
+    def compare_and_swap(self, namespace, key, expected, desired) -> bool:
+        """Atomically replace the value only if the current value equals
+        expected. Return True on swap, False if the key is absent or the current
+        value differs (nothing written)."""
+        namespace_bytes, key_bytes = map(_bytes, (namespace, key))
+        expected_bytes, desired_bytes = map(_bytes, (expected, desired))
+        ns_store, ns_ptr = _buffer(namespace_bytes)
+        key_store, key_ptr = _buffer(key_bytes)
+        expected_store, expected_ptr = _buffer(expected_bytes)
+        desired_store, desired_ptr = _buffer(desired_bytes)
+        status = _lib.sdb_kv_compare_and_swap(
+            self._require_open(),
+            ns_ptr, len(namespace_bytes), key_ptr, len(key_bytes),
+            expected_ptr, len(expected_bytes),
+            desired_ptr, len(desired_bytes),
+        )
+        del ns_store, key_store, expected_store, desired_store
+        if status == 12:
+            return False
+        _raise_status(status)
+        return True
+
+    def increment(self, namespace, key, delta: int = 1) -> int:
+        """Atomically add delta to an 8-byte little-endian counter and return
+        the new value. A missing key is treated as 0 and created. Raises Error
+        if the existing value is not exactly 8 bytes, or on signed overflow."""
+        namespace_bytes, key_bytes = map(_bytes, (namespace, key))
+        ns_store, ns_ptr = _buffer(namespace_bytes)
+        key_store, key_ptr = _buffer(key_bytes)
+        new_value = ctypes.c_int64()
+        status = _lib.sdb_kv_increment(
+            self._require_open(),
+            ns_ptr, len(namespace_bytes), key_ptr, len(key_bytes),
+            ctypes.c_int64(delta), ctypes.byref(new_value),
+        )
+        del ns_store, key_store
+        _raise_status(status)
+        return int(new_value.value)
+
+    def info(self) -> dict[str, int | bool]:
+        """O(1) configuration snapshot read straight from the in-memory
+        superblock: page_size, encrypted, kdf_iterations, generation,
+        checkpoint_lsn, page_count. Unlike verify() it never walks the tree."""
+        result = _InfoResult()
+        result.struct_size = ctypes.sizeof(_InfoResult)
+        _raise_status(_lib.sdb_database_info(
+            self._require_open(), ctypes.byref(result)
+        ))
+        return {
+            "page_size": int(result.page_size),
+            "encrypted": bool(result.encrypted),
+            "kdf_iterations": int(result.kdf_iterations),
+            "generation": int(result.generation),
+            "checkpoint_lsn": int(result.checkpoint_lsn),
+            "page_count": int(result.page_count),
+        }
 
     def create_index(self, collection, name, *, unique: bool = False) -> None:
         collection_bytes, name_bytes = map(_bytes, (collection, name))
@@ -1151,6 +1338,9 @@ def migrate_file(
 
 __all__ = [
     "ABI_VERSION",
+    "SDB_CACHE_AUTO",
+    "SDB_SYNCHRONOUS_FULL",
+    "SDB_SYNCHRONOUS_NORMAL",
     "AuthenticationError",
     "BusyError",
     "ConflictError",

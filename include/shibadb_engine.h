@@ -157,10 +157,22 @@ typedef struct sdb_compact_result {
  * @generation:          Monotonic superblock generation (bumped every commit).
  * @checkpoint_lsn:      Log-sequence number of the most recent checkpoint.
  * @page_count:          Highest page id ever allocated (file high-water mark).
+ * @wal_size_bytes:      Current WAL byte tail (bytes written since the last
+ *                       checkpoint reset); compare against
+ *                       @checkpoint_threshold_bytes to decide when to checkpoint.
+ * @checkpoint_threshold_bytes: WAL byte size at which the engine triggers a
+ *                       deferred checkpoint.
+ * @freelist_head_page:  Head page id of the on-disk freelist, or 0 when no
+ *                       pages are free. This is the freelist HEAD, not a count;
+ *                       a nonzero value means compact can reclaim space. For an
+ *                       exact free-page or stale-entry count use
+ *                       sdb_database_verify (a full scan).
  * @reserved:            Reserved for future fields; always zero.
  *
  * Unlike sdb_verify_result, this is read straight from the in-memory
- * superblock: it costs O(1), never walks the tree, and never touches disk.
+ * superblock/pager: it costs O(1), never walks the tree, and never touches
+ * disk. wal_size_bytes, checkpoint_threshold_bytes and freelist_head_page are
+ * all in-memory reads with the same guarantee.
  */
 typedef struct sdb_info_result {
     uint32_t struct_size;
@@ -171,7 +183,10 @@ typedef struct sdb_info_result {
     uint64_t generation;
     uint64_t checkpoint_lsn;
     uint64_t page_count;
-    uint64_t reserved[4];
+    uint64_t wal_size_bytes;
+    uint64_t checkpoint_threshold_bytes;
+    uint64_t freelist_head_page;
+    uint64_t reserved[1];
 } sdb_info_result;
 
 typedef bool (*sdb_index_visit_fn)(

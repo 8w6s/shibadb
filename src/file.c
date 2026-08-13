@@ -104,6 +104,12 @@ static sdb_status sdb_file_open_windows(
         if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
             return SDB_E_CONFLICT;
         }
+        if (error == ERROR_DISK_FULL || error == ERROR_HANDLE_DISK_FULL) {
+            return SDB_E_NO_SPACE;
+        }
+        if (error == ERROR_ACCESS_DENIED || error == ERROR_WRITE_PROTECT) {
+            return SDB_E_ACCESS_DENIED;
+        }
         return SDB_E_IO;
     }
     free(wide_path);
@@ -206,7 +212,15 @@ sdb_status sdb_file_write_full(
         }
         if (!WriteFile(
                 file->handle, input + completed, (DWORD)chunk, &transferred, &operation
-            ) || transferred == 0U) {
+            )) {
+            const DWORD write_error = GetLastError();
+            if (write_error == ERROR_DISK_FULL
+                    || write_error == ERROR_HANDLE_DISK_FULL) {
+                return SDB_E_NO_SPACE;
+            }
+            return SDB_E_IO;
+        }
+        if (transferred == 0U) {
             return SDB_E_IO;
         }
         completed += (size_t)transferred;
@@ -341,10 +355,29 @@ sdb_status sdb_file_sync_parent_directory(const char *path)
     if (!CloseHandle(directory_handle)) {
         return SDB_E_IO;
     }
+    /*
+     * Windows has no POSIX-style fsync(directory). FlushFileBuffers is defined
+     * only for volume and file handles; on NTFS a directory handle returns
+     * ERROR_INVALID_FUNCTION (and, depending on the handle's granted access,
+     * ERROR_ACCESS_DENIED or ERROR_NOT_SUPPORTED). Tolerating those is
+     * DELIBERATE, not a silent swallow of a real error:
+     *   - NTFS journals every namespace change (create/rename/delete) via
+     *     $LogFile, so the operation is crash-recoverable from the log once it
+     *     returns; there is no separate directory page to flush the way
+     *     ext4/xfs require, which is why Windows exposes no directory-fsync API.
+     *   - Callers that need the swap durable already use
+     *     MOVEFILE_WRITE_THROUGH / REPLACEFILE_WRITE_THROUGH (sdb_file_replace)
+     *     and FlushFileBuffers on the FILE handle (sdb_file_sync) before this
+     *     call -- that is the Windows barrier that forces the change to stable
+     *     storage. SQLite (winSync), LMDB and PostgreSQL skip directory sync on
+     *     Windows for the same reason.
+     * Every other failure -- including ERROR_INVALID_HANDLE, which on a handle
+     * CreateFileW just returned as valid indicates a genuine fault, not an
+     * unsupported operation -- must propagate instead of being hidden.
+     */
     return flush_error == ERROR_SUCCESS
         || flush_error == ERROR_ACCESS_DENIED
         || flush_error == ERROR_INVALID_FUNCTION
-        || flush_error == ERROR_INVALID_HANDLE
         || flush_error == ERROR_NOT_SUPPORTED
         ? SDB_OK : SDB_E_IO;
 }
@@ -641,6 +674,12 @@ static sdb_status sdb_file_open_posix(
         if (errno == EEXIST) {
             return SDB_E_CONFLICT;
         }
+        if (errno == ENOSPC) {
+            return SDB_E_NO_SPACE;
+        }
+        if (errno == EACCES || errno == EROFS) {
+            return SDB_E_ACCESS_DENIED;
+        }
         return SDB_E_IO;
     }
     file_out->descriptor = descriptor;
@@ -750,7 +789,16 @@ sdb_status sdb_file_write_full(
                 file->descriptor, input + completed, chunk, (off_t)position
             );
         } while (transferred < 0 && errno == EINTR);
-        if (transferred <= 0) {
+        if (transferred < 0) {
+            if (errno == ENOSPC) {
+                return SDB_E_NO_SPACE;
+            }
+            if (errno == EROFS || errno == EACCES) {
+                return SDB_E_ACCESS_DENIED;
+            }
+            return SDB_E_IO;
+        }
+        if (transferred == 0) {
             return SDB_E_IO;
         }
         completed += (size_t)transferred;
