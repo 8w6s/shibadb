@@ -48,6 +48,10 @@ const char *sdb_status_string(sdb_status status)
         return "database busy";
     case SDB_E_OUT_OF_MEMORY:
         return "out of memory";
+    case SDB_E_NO_SPACE:
+        return "no space left on device";
+    case SDB_E_ACCESS_DENIED:
+        return "access denied";
     }
     return "unknown status";
 }

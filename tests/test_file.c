@@ -4,6 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 static const char *test_path = "test-file-io.tmp";
 
 static void cleanup(void)
@@ -104,6 +109,59 @@ static void test_injected_io_fault_surfaces(void)
     (void)puts("injected io fault surfaces SDB_E_IO: ok");
 }
 
+static void test_sync_parent_directory_contract(void)
+{
+    sdb_file file;
+    cleanup();
+    /* NULL / empty / trailing-separator are rejected up front. */
+    assert(sdb_file_sync_parent_directory(NULL) == SDB_E_INVALID_ARGUMENT);
+    assert(sdb_file_sync_parent_directory("") == SDB_E_INVALID_ARGUMENT);
+    assert(sdb_file_sync_parent_directory("x/") == SDB_E_INVALID_ARGUMENT);
+    /* Parent of a real file (parent resolves to ".") must succeed. */
+    assert(sdb_file_create_new(test_path, &file) == SDB_OK);
+    assert(sdb_file_close(&file) == SDB_OK);
+    assert(sdb_file_sync_parent_directory(test_path) == SDB_OK);
+    cleanup();
+    /* A non-existent parent directory must surface SDB_E_IO, never a false OK. */
+    assert(sdb_file_sync_parent_directory(
+        "no-such-parent-dir-xyz/file.tmp"
+    ) == SDB_E_IO);
+    (void)puts("sync_parent_directory contract: ok");
+}
+
+static void test_open_denied_maps_access(void)
+{
+    sdb_file file;
+    cleanup();
+    assert(sdb_file_create_new(test_path, &file) == SDB_OK);
+    assert(sdb_file_close(&file) == SDB_OK);
+#ifdef _WIN32
+    {
+        wchar_t wide[64];
+        int i = 0;
+        for (; test_path[i] != '\0'; ++i) {
+            wide[i] = (wchar_t)test_path[i]; /* test_path is pure ASCII */
+        }
+        wide[i] = L'\0';
+        assert(SetFileAttributesW(wide, FILE_ATTRIBUTE_READONLY));
+        /* Opening a read-only-attr file for writing => ERROR_ACCESS_DENIED. */
+        assert(sdb_file_open_existing(test_path, true, &file)
+            == SDB_E_ACCESS_DENIED);
+        (void)SetFileAttributesW(wide, FILE_ATTRIBUTE_NORMAL);
+    }
+#else
+    if (geteuid() != 0) { /* root bypasses permission bits; skip there */
+        assert(chmod(test_path, 0) == 0);
+        /* No permission bits: opening O_RDWR => EACCES. */
+        assert(sdb_file_open_existing(test_path, true, &file)
+            == SDB_E_ACCESS_DENIED);
+        (void)chmod(test_path, 0600);
+    }
+#endif
+    cleanup();
+    (void)puts("open denied maps to access-denied: ok");
+}
+
 int main(void)
 {
     sdb_file file;
@@ -137,6 +195,8 @@ int main(void)
     test_open_existing_missing_returns_not_found();
     test_create_new_existing_returns_conflict();
     test_injected_io_fault_surfaces();
+    test_sync_parent_directory_contract();
+    test_open_denied_maps_access();
 
     (void)puts("file tests: ok");
     return 0;

@@ -16,6 +16,8 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #endif
 
 #define THREAD_COUNT 16U
@@ -28,7 +30,6 @@ static const char *compact_db_path = "test-group-commit-compact.tmp";
 static const char *compact_wal_path = "test-group-commit-compact.tmp.wal";
 static const char *compact_lock_path = "test-group-commit-compact.tmp.lock";
 static const uint8_t namespace_name[] = "gc";
-#define COMPACT_ROUNDS 24U
 #define HOT_KEY_WRITES 128U
 
 static void encode_u32(uint8_t output[4], uint32_t value)
@@ -45,6 +46,9 @@ typedef struct worker_context {
     bool failed;
     int fail_status;
     uint32_t fail_record;
+#ifndef _WIN32
+    atomic_uint *finished;
+#endif
 } worker_context;
 
 /*
@@ -89,7 +93,11 @@ static DWORD WINAPI worker_entry(LPVOID argument)
 #else
 static void *worker_entry(void *argument)
 {
-    run_worker((worker_context *)argument);
+    worker_context *context = (worker_context *)argument;
+    run_worker(context);
+    if (context->finished != NULL) {
+        atomic_fetch_add_explicit(context->finished, 1U, memory_order_release);
+    }
     return NULL;
 }
 #endif
@@ -133,13 +141,14 @@ static void test_compact_races_commit(void)
     sdb_database *database = NULL;
     worker_context contexts[THREAD_COUNT];
     uint32_t index;
-    unsigned round;
     size_t compact_ok = 0U;
     size_t compact_busy = 0U;
 #ifdef _WIN32
     HANDLE threads[THREAD_COUNT];
 #else
     pthread_t threads[THREAD_COUNT];
+    atomic_uint finished;
+    atomic_init(&finished, 0U);
 #endif
     (void)remove(compact_db_path);
     (void)remove(compact_wal_path);
@@ -152,6 +161,9 @@ static void test_compact_races_commit(void)
         contexts[index].failed = false;
         contexts[index].fail_status = 0;
         contexts[index].fail_record = 0U;
+#ifndef _WIN32
+        contexts[index].finished = &finished;
+#endif
 #ifdef _WIN32
         threads[index] = CreateThread(
             NULL, 0U, worker_entry, &contexts[index], 0U, NULL
@@ -163,16 +175,42 @@ static void test_compact_races_commit(void)
         ) == 0);
 #endif
     }
-    for (round = 0U; round < COMPACT_ROUNDS; ++round) {
+    for (;;) {
         sdb_compact_result result;
-        const sdb_status status =
-            sdb_database_compact(database, &options, &result);
+        sdb_status status;
+        bool workers_done;
+#ifdef _WIN32
+        workers_done = (WaitForMultipleObjects(
+            THREAD_COUNT, threads, TRUE, 0) == WAIT_OBJECT_0);
+#else
+        workers_done = (atomic_load_explicit(
+            &finished, memory_order_acquire) >= THREAD_COUNT);
+#endif
+        status = sdb_database_compact(database, &options, &result);
         assert(status == SDB_OK || status == SDB_E_BUSY);
         if (status == SDB_OK) {
             ++compact_ok;
         } else {
             ++compact_busy;
         }
+        /*
+         * Stop as soon as the guard is proven exercised (a BUSY was observed)
+         * or the workers have all finished. Breaking on the first BUSY is what
+         * this test needs — it does not require draining the whole worker
+         * lifetime — and it keeps the loop from busy-spinning compaction for
+         * the entire (very long under ASan/TSan) run, which otherwise pushed
+         * the test past its per-test timeout. Yield between attempts so the
+         * committing workers get the CPU and a commit reliably lands in flight
+         * while a compaction is trying, instead of this thread starving them.
+         */
+        if (workers_done || compact_busy > 0U) {
+            break;
+        }
+#ifdef _WIN32
+        (void)SwitchToThread();
+#else
+        sched_yield();
+#endif
     }
     for (index = 0U; index < THREAD_COUNT; ++index) {
 #ifdef _WIN32
@@ -188,9 +226,13 @@ static void test_compact_races_commit(void)
      * commit_in_flight guard and returned BUSY. Without this, a run where every
      * compact happened to return OK would pass trivially and prove NOTHING
      * about the guard (it would stay green even if commit_in_flight were
-     * removed). A compact that hits the guard returns immediately, so the loop
-     * runs fast while the 16 workers are still committing — compact_busy is
-     * reliably > 0 in practice.
+     * removed). The compact loop above runs continuously for the ENTIRE
+     * lifetime of the 16 committing workers (it stops only once every worker
+     * has exited), so it spans the whole ~1536-commit window regardless of how
+     * the scheduler interleaves threads — a fixed round count could finish
+     * before any worker got a commit in flight under a saturated CPU (e.g. an
+     * ASan/TSan run sharing cores with other tests), leaving compact_busy at 0
+     * and failing this assertion spuriously.
      */
     assert(compact_busy > 0U);
     /*
@@ -271,6 +313,9 @@ int main(void)
         contexts[index].failed = false;
         contexts[index].fail_status = 0;
         contexts[index].fail_record = 0U;
+#ifndef _WIN32
+        contexts[index].finished = NULL;
+#endif
 #ifdef _WIN32
         threads[index] = CreateThread(
             NULL, 0U, worker_entry, &contexts[index], 0U, NULL

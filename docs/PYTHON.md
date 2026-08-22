@@ -12,7 +12,7 @@ either place it on the platform library search path or set
 
 ```sh
 python3 python/build_wheel.py dist
-python3 -m pip install dist/shibadb-1.0.0-py3-none-any.whl
+python3 -m pip install dist/shibadb-0.1.0-py3-none-any.whl
 export SHIBADB_LIBRARY=/path/to/libshibadb.so.1
 ```
 

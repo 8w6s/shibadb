@@ -84,7 +84,11 @@ typedef enum sdb_status {
 
     SDB_E_BUSY = 13,
 
-    SDB_E_OUT_OF_MEMORY = 14
+    SDB_E_OUT_OF_MEMORY = 14,
+
+    SDB_E_NO_SPACE = 15,
+
+    SDB_E_ACCESS_DENIED = 16
 } sdb_status;
 
 typedef struct sdb_superblock_v1 {

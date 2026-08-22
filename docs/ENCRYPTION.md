@@ -16,6 +16,33 @@ This implementation has deterministic standard-vector, tamper, fuzz, nonce,
 rotation, crash, and sanitizer coverage. It has not received an independent
 third-party cryptographic audit.
 
+## Threat model: unencrypted vs encrypted
+
+A database created without a password is stored in plaintext. Every allocated
+page carries a CRC-32 (ISO-HDLC, slice-by-8) computed over the page image with
+the checksum field zeroed; `sdb_page_verify` refuses a page whose stored and
+computed CRC disagree. That CRC detects **accidental damage** — bit-rot, torn
+writes, a truncated file, a mis-sized read — and nothing more. It is **not** a
+message-authentication code: an attacker who can modify the file offline can
+edit any page and recompute a matching CRC.
+So the check provides **damage detection, not authenticity**, and plaintext
+mode provides **no confidentiality** at all.
+Treat an unencrypted database like any other plaintext file: only open
+one that came from a source you trust, on storage you control. This matches the
+trust-domain boundary in [`../SECURITY.md`](../SECURITY.md) — tampering with a
+file the attacker controls before it is opened is out of scope for plaintext
+databases.
+
+A database created with a non-empty password additionally wraps every page and
+WAL page-image in an XChaCha20-Poly1305 envelope (see the key hierarchy below).
+The 128-bit Poly1305 tag is a true authenticator, verified in constant time
+before any plaintext is returned, so tampering is detected and rejected rather
+than merely noticed:
+**the cryptographic guarantee comes from the tag, not the CRC**.
+Encryption also provides confidentiality of page contents. In short —
+unencrypted mode: accidental-damage detection only; encrypted mode:
+authenticity plus confidentiality.
+
 ## Key hierarchy
 
 Creation obtains a random 256-bit data-encryption key from the operating

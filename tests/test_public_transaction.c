@@ -1,4 +1,5 @@
 #include "shibadb_engine.h"
+#include "engine_internal.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -299,6 +300,42 @@ static void test_operation_limit(sdb_database *database)
     }
 }
 
+/*
+ * Regression for the batch-poison gap on in-place mutations. A large
+ * (multi-chunk) value is put and then deleted in the SAME explicit
+ * transaction. The delete removes chunk 0 in place on a leaf already staged by
+ * the put (that leaf still holds chunk 1, so it is not reclaimed and the
+ * batch's distinct-page count does not change), then hits an injected
+ * key-build failure at chunk 1. That error is returned to the caller; a caller
+ * that ignores it and commits anyway must NOT get a successful commit of the
+ * half-deleted object. The batch must be poisoned so commit aborts. Before the
+ * revision-counter fix, poison keyed off the distinct-page count and missed
+ * the in-place mutation, so commit succeeded and left the object unreadable.
+ */
+static void test_poison_partial_inplace_delete(sdb_database *database)
+{
+    sdb_transaction *transaction = NULL;
+    static const uint8_t key[] = "poison-key";
+    uint8_t big[5000];
+    sdb_status commit_status;
+    (void)memset(big, 0x5a, sizeof(big));
+    assert(sdb_transaction_begin(database, &transaction) == SDB_OK);
+    assert(sdb_transaction_kv_put(
+        transaction, namespace_name, sizeof(namespace_name),
+        key, sizeof(key), big, sizeof(big)
+    ) == SDB_OK);
+    sdb_engine_chunk_key_fail_for_testing(1U);
+    /* Deliberately ignore the delete's error to exercise the poison guard. */
+    (void)sdb_transaction_kv_delete(
+        transaction, namespace_name, sizeof(namespace_name), key, sizeof(key)
+    );
+    sdb_engine_chunk_key_clear_failure_for_testing();
+    commit_status = sdb_transaction_commit(transaction);
+    assert(commit_status != SDB_OK);
+    /* commit/rollback leave the handle allocated; close frees it. */
+    assert(sdb_transaction_close(transaction) == SDB_OK);
+}
+
 int main(void)
 {
     sdb_database_options options;
@@ -320,6 +357,7 @@ int main(void)
     test_multi_object_commit(database);
     test_document_and_unique_index(database);
     test_operation_limit(database);
+    test_poison_partial_inplace_delete(database);
     assert(sdb_database_verify(database, &verify) == SDB_OK);
     /*
      * verify() must actually reflect the data the tests committed, not merely

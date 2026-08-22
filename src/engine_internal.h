@@ -17,6 +17,8 @@ sdb_status sdb_engine_strip_document_reverse_for_testing(
     const uint8_t *document_id,
     size_t document_id_size
 );
+void sdb_engine_chunk_key_fail_for_testing(uint32_t chunk_index);
+void sdb_engine_chunk_key_clear_failure_for_testing(void);
 #endif
 
 #endif

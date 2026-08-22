@@ -442,17 +442,22 @@ static sdb_status sdb_engine_alloc_generation(
  * _delete (e.g. a key-build malloc failure), the batch's own failure flag is
  * never set, so an explicit-transaction caller that ignores the returned error
  * and commits anyway would otherwise persist the partial rows. The
- * `count != count_before` guard limits poisoning to operations that actually
- * staged something: a pure validation error before any staging leaves the
- * transaction commitable. Never clobbers an existing failure.
+ * `revision != revision_before` guard limits poisoning to operations that
+ * actually staged something: a pure validation error before any staging leaves
+ * the transaction commitable. It keys off the batch revision (which ticks on
+ * every stage, including an in-place re-stage of an already-present page)
+ * rather than the distinct-page count, because an op that only mutates a
+ * staged page in place before failing leaves the count unchanged yet has
+ * committed a partial change that must not survive. Never clobbers an existing
+ * failure.
  */
 static sdb_status sdb_mutation_poison_on_partial(
-    sdb_engine_mutation *mutation, size_t count_before, sdb_status status
+    sdb_engine_mutation *mutation, uint64_t revision_before, sdb_status status
 )
 {
     if (status != SDB_OK && mutation != NULL
         && mutation->batch.failure == SDB_OK
-        && mutation->batch.count != count_before) {
+        && mutation->batch.revision != revision_before) {
         mutation->batch.failure = status;
     }
     return status;
@@ -597,6 +602,21 @@ static sdb_status sdb_object_key(
     );
 }
 
+#if SDB_TESTING
+static bool sdb_test_chunk_key_fail_armed = false;
+static uint32_t sdb_test_chunk_key_fail_index = 0U;
+void sdb_engine_chunk_key_fail_for_testing(uint32_t chunk_index)
+{
+    sdb_test_chunk_key_fail_armed = true;
+    sdb_test_chunk_key_fail_index = chunk_index;
+}
+void sdb_engine_chunk_key_clear_failure_for_testing(void)
+{
+    sdb_test_chunk_key_fail_armed = false;
+    sdb_test_chunk_key_fail_index = 0U;
+}
+#endif
+
 static sdb_status sdb_chunk_key(
     uint16_t kind,
     const uint8_t *namespace_name,
@@ -609,7 +629,20 @@ static sdb_status sdb_chunk_key(
     size_t *output_size
 )
 {
-    sdb_status status = sdb_engine_pair_key(
+    sdb_status status;
+#if SDB_TESTING
+    /*
+     * Fault-injection hook: force the composite-key allocation for one chunk
+     * index to fail, exercising the mid-delete key-build error path that the
+     * batch poison guard must catch (a chunk deleted in place before the
+     * failure must still poison the batch so a later commit aborts).
+     */
+    if (sdb_test_chunk_key_fail_armed
+        && chunk_index == sdb_test_chunk_key_fail_index) {
+        return SDB_E_OUT_OF_MEMORY;
+    }
+#endif
+    status = sdb_engine_pair_key(
         SDB_CHUNK_KEY_PREFIX,
         (uint8_t)kind,
         namespace_name,
@@ -972,8 +1005,8 @@ static sdb_status sdb_object_put(
     sdb_object_metadata metadata;
     sdb_object_metadata previous;
     bool has_previous = false;
-    const size_t count_before =
-        mutation != NULL ? mutation->batch.count : 0U;
+    const uint64_t revision_before =
+        mutation != NULL ? mutation->batch.revision : 0U;
     sdb_status status;
     /*
      * Read the current version (if any) BEFORE planning the new one, so an
@@ -989,7 +1022,7 @@ static sdb_status sdb_object_put(
     if (status == SDB_OK) {
         has_previous = true;
     } else if (status != SDB_E_NOT_FOUND) {
-        return sdb_mutation_poison_on_partial(mutation, count_before, status);
+        return sdb_mutation_poison_on_partial(mutation, revision_before, status);
     }
     status = sdb_object_plan(
         database,
@@ -1038,7 +1071,7 @@ static sdb_status sdb_object_put(
             key, key_size, previous.generation, previous.chunk_count
         );
     }
-    return sdb_mutation_poison_on_partial(mutation, count_before, status);
+    return sdb_mutation_poison_on_partial(mutation, revision_before, status);
 }
 
 static sdb_status sdb_object_get(
@@ -1155,8 +1188,8 @@ static sdb_status sdb_object_delete(
     uint8_t *metadata_key = NULL;
     size_t metadata_key_size;
     sdb_object_metadata metadata;
-    const size_t count_before =
-        mutation != NULL ? mutation->batch.count : 0U;
+    const uint64_t revision_before =
+        mutation != NULL ? mutation->batch.revision : 0U;
     sdb_status meta_status;
     sdb_status status = SDB_OK;
     /*
@@ -1186,7 +1219,7 @@ static sdb_status sdb_object_delete(
          * through so deleting an absent key stays idempotent as before.
          */
         return sdb_mutation_poison_on_partial(
-            mutation, count_before, meta_status
+            mutation, revision_before, meta_status
         );
     }
     /*
@@ -1205,7 +1238,7 @@ static sdb_status sdb_object_delete(
         }
         free(metadata_key);
     }
-    return sdb_mutation_poison_on_partial(mutation, count_before, status);
+    return sdb_mutation_poison_on_partial(mutation, revision_before, status);
 }
 
 void sdb_database_options_init(sdb_database_options *options)
@@ -2732,7 +2765,7 @@ static sdb_status sdb_document_put_in_mutation(
     bool has_previous = false;
     bool *unique;
     size_t index;
-    size_t count_before = 0U;
+    uint64_t revision_before = 0U;
     sdb_status status;
     if (database == NULL || !database->open
         || !sdb_engine_bytes_valid(document_id, document_id_size)
@@ -2751,7 +2784,7 @@ static sdb_status sdb_document_put_in_mutation(
     if (term_count != 0U && unique == NULL) {
         return SDB_E_OUT_OF_MEMORY;
     }
-    count_before = mutation != NULL ? mutation->batch.count : 0U;
+    revision_before = mutation != NULL ? mutation->batch.revision : 0U;
     /*
      * Read the PREVIOUS version's metadata before staging anything, so an
      * overwrite can reclaim what it superseded: the old generation + chunk_count
@@ -2769,7 +2802,7 @@ static sdb_status sdb_document_put_in_mutation(
         has_previous = true;
     } else if (status != SDB_E_NOT_FOUND) {
         free(unique);
-        return sdb_mutation_poison_on_partial(mutation, count_before, status);
+        return sdb_mutation_poison_on_partial(mutation, revision_before, status);
     }
     status = sdb_object_plan(
         database,
@@ -2893,7 +2926,7 @@ static sdb_status sdb_document_put_in_mutation(
         );
     }
     free(unique);
-    return sdb_mutation_poison_on_partial(mutation, count_before, status);
+    return sdb_mutation_poison_on_partial(mutation, revision_before, status);
 }
 
 static sdb_status sdb_document_put_unlocked(
@@ -2964,7 +2997,7 @@ static sdb_status sdb_document_delete_in_mutation(
     size_t document_id_size
 )
 {
-    size_t count_before;
+    uint64_t revision_before;
     sdb_object_metadata metadata;
     bool reverse_found = false;
     sdb_status status;
@@ -2972,7 +3005,7 @@ static sdb_status sdb_document_delete_in_mutation(
         || !sdb_engine_bytes_valid(document_id, document_id_size)) {
         return SDB_E_INVALID_ARGUMENT;
     }
-    count_before = mutation != NULL ? mutation->batch.count : 0U;
+    revision_before = mutation != NULL ? mutation->batch.revision : 0U;
     status = sdb_object_read_metadata(
         database, mutation, (uint16_t)SDB_OBJECT_DOCUMENT,
         collection, collection_size, document_id, document_id_size, &metadata
@@ -3003,7 +3036,7 @@ static sdb_status sdb_document_delete_in_mutation(
             document_id_size
         );
     }
-    return sdb_mutation_poison_on_partial(mutation, count_before, status);
+    return sdb_mutation_poison_on_partial(mutation, revision_before, status);
 }
 
 static sdb_status sdb_document_delete_unlocked(
@@ -4744,6 +4777,9 @@ sdb_status sdb_database_info(
     result_out->generation = superblock->generation;
     result_out->checkpoint_lsn = superblock->checkpoint_lsn;
     result_out->page_count = superblock->next_page_id;
+    result_out->wal_size_bytes = database->pager.wal_tail;
+    result_out->checkpoint_threshold_bytes = database->pager.checkpoint_threshold;
+    result_out->freelist_head_page = superblock->freelist_page;
     sdb_mutex_unlock(&database->mutex);
     return SDB_OK;
 }

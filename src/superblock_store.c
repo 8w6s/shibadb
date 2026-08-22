@@ -116,6 +116,16 @@ static sdb_status sdb_superblock_load_slots(
         }
     }
     *valid_count_out = valid_count;
+    /*
+     * A read I/O error on ONE slot (e.g. a bad sector) must not defeat the
+     * two-slot redundancy: if the other slot decoded cleanly, report success
+     * and let the caller select it. The I/O error is only fatal when NO slot
+     * is usable. This mirrors the SDB_E_TRUNCATED path, which already leaves
+     * io_failure unset and falls back to the intact mirror.
+     */
+    if (valid_count > 0U) {
+        return SDB_OK;
+    }
     return io_failure ? SDB_E_IO : SDB_OK;
 }
 

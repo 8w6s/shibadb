@@ -236,6 +236,48 @@ static void test_truncated_second_mirror_recovers(void)
     cleanup();
 }
 
+static void test_io_error_one_slot_falls_back(void)
+{
+    sdb_superblock_v1 value = sample(70U);
+    sdb_superblock_read_result result;
+    sdb_file file;
+    cleanup();
+    assert(sdb_superblock_store_create(test_path, &value) == SDB_OK);
+    assert(sdb_file_open_existing(test_path, true, &file) == SDB_OK);
+    /*
+     * op0 reads slot0 (succeeds); op1 reads slot1 -> injected SDB_E_IO,
+     * modelling a bad sector on one mirror. The intact slot0 must still
+     * satisfy the open — a single-slot read error must not defeat redundancy.
+     */
+    sdb_file_fail_after_for_testing(&file, 1U);
+    assert(sdb_superblock_store_read_file(&file, &result) == SDB_OK);
+    sdb_file_clear_failure_for_testing(&file);
+    assert(result.valid_mirror_count == 1U);
+    assert(result.selected_slot == 0U);
+    assert(result.superblock.generation == 70U);
+    assert(sdb_file_close(&file) == SDB_OK);
+    cleanup();
+}
+
+static void test_io_error_both_slots_is_fatal(void)
+{
+    sdb_superblock_v1 value = sample(71U);
+    sdb_superblock_read_result result;
+    sdb_file file;
+    cleanup();
+    assert(sdb_superblock_store_create(test_path, &value) == SDB_OK);
+    assert(sdb_file_open_existing(test_path, true, &file) == SDB_OK);
+    /*
+     * op0 (slot0 read) already fails, so both slot reads are injected: with no
+     * usable slot the I/O error is correctly fatal (SDB_E_IO, not CORRUPT).
+     */
+    sdb_file_fail_after_for_testing(&file, 0U);
+    assert(sdb_superblock_store_read_file(&file, &result) == SDB_E_IO);
+    sdb_file_clear_failure_for_testing(&file);
+    assert(sdb_file_close(&file) == SDB_OK);
+    cleanup();
+}
+
 static void test_update_failure_at_every_io_boundary_is_recoverable(void)
 {
     size_t fail_after;
@@ -493,6 +535,8 @@ int main(void)
     test_newer_slot0_selected_by_generation();
     test_same_generation_split_brain_is_rejected();
     test_truncated_second_mirror_recovers();
+    test_io_error_one_slot_falls_back();
+    test_io_error_both_slots_is_fatal();
     test_update_failure_at_every_io_boundary_is_recoverable();
     test_update_rejects_next_page_id_retreat();
     test_update_accepts_next_page_id_equal();

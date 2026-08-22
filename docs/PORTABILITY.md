@@ -24,8 +24,15 @@ warnings-as-errors cross-build is an independent Windows-header/compiler gate.
   suspends/reopens its source handle around the replacement operation.
 - **Windows path and directory handling.** Absolute drive and UNC UTF-8 paths
   are converted to extended-length Win32 paths; drive roots are preserved when
-  syncing a parent; unsupported directory `FlushFileBuffers` results are
-  tolerated while real I/O errors still propagate.
+  syncing a parent. Windows exposes no POSIX-style directory fsync:
+  `FlushFileBuffers` on a directory handle is unsupported on NTFS
+  (`ERROR_INVALID_FUNCTION`/`ERROR_ACCESS_DENIED`/`ERROR_NOT_SUPPORTED`).
+  Tolerating those is a deliberate, documented no-op — NTFS `$LogFile` journals
+  namespace changes and callers force the swap durable via
+  `MOVEFILE_WRITE_THROUGH`/`REPLACEFILE_WRITE_THROUGH` plus `FlushFileBuffers`
+  on the file handle (SQLite/LMDB/PostgreSQL do the same). A genuinely bad
+  handle (`ERROR_INVALID_HANDLE`) and every other error still propagate as
+  `SDB_E_IO`.
 - **Windows local verification (2026-08-02).** MinGW compiled every core,
   shared-library, and test target with warnings as errors. All 48 applicable
   native C tests passed sequentially under Wine, including recovery,

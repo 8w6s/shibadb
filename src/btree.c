@@ -122,6 +122,7 @@ static sdb_status sdb_btree_stage(
             free(changes->items[index].payload);
             changes->items[index].payload = payload;
             changes->items[index].payload_size = payload_size;
+            ++changes->revision;
             return SDB_OK;
         }
     }
@@ -148,6 +149,7 @@ static sdb_status sdb_btree_stage(
     changes->items[changes->count].payload = payload;
     changes->items[changes->count].payload_size = payload_size;
     ++changes->count;
+    ++changes->revision;
     return SDB_OK;
 }
 
