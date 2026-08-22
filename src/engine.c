@@ -6583,6 +6583,33 @@ sdb_status sdb_cursor_close(sdb_cursor *cursor)
     return SDB_OK;
 }
 
+/*
+ * Byte-successor of a prefix: the smallest key that does NOT begin with it, used
+ * as the exclusive upper edge of the prefix's range. Strips trailing 0xFF bytes
+ * and increments the last remaining one. An all-0xFF prefix (or an empty one)
+ * has no successor — nothing sorts above it — and reports false; callers then
+ * leave the range's upper end unbounded.
+ */
+static bool sdb_prefix_successor(
+    const uint8_t *prefix,
+    size_t prefix_size,
+    uint8_t *successor_out,
+    size_t *successor_size_out
+)
+{
+    size_t size = prefix_size;
+    while (size > 0U && prefix[size - 1U] == 0xFFU) {
+        size -= 1U;
+    }
+    if (size == 0U) {
+        return false;
+    }
+    (void)memcpy(successor_out, prefix, size);
+    successor_out[size - 1U] += 1U;
+    *successor_size_out = size;
+    return true;
+}
+
 sdb_status sdb_kv_scan_prefix(
     sdb_database *database,
     const uint8_t *namespace_name,
@@ -6598,30 +6625,63 @@ sdb_status sdb_kv_scan_prefix(
     sdb_snapshot *snapshot = NULL;
     sdb_cursor *cursor = NULL;
     sdb_cursor_options cursor_options;
+    uint8_t *successor = NULL;
+    size_t successor_size = 0U;
     size_t matches = 0U;
+    bool reverse = false;
     sdb_status status;
     if (visitor == NULL || (prefix == NULL && prefix_size != 0U)) {
         return SDB_E_INVALID_ARGUMENT;
     }
-    if (options != NULL
-        && (options->struct_size < (uint32_t)sizeof(*options)
-            || options->reverse)) {
+    if (options != NULL) {
+        if (options->struct_size < (uint32_t)sizeof(*options)) {
+            return SDB_E_INVALID_ARGUMENT;
+        }
+        reverse = options->reverse;
+    }
+    /*
+     * Bound the prefix here rather than leaning on sdb_cursor_open's bound
+     * check: the reverse path derives a successor of the same length, so an
+     * oversized prefix must be refused before it is copied into a buffer.
+     */
+    if (prefix_size > SDB_ENGINE_MAX_NAME_SIZE) {
         return SDB_E_INVALID_ARGUMENT;
     }
     if (match_count_out != NULL) {
         *match_count_out = 0U;
     }
-    status = sdb_snapshot_open(database, &snapshot);
-    if (status != SDB_OK) {
-        return status;
-    }
     sdb_cursor_options_init(&cursor_options);
     /*
-     * Seek straight to the prefix; the walk stops at the first key that no
-     * longer begins with it (keys sharing a prefix are contiguous).
+     * Forward: seek straight to the prefix; the walk stops at the first key that
+     * no longer begins with it (keys sharing a prefix are contiguous).
+     *
+     * Reverse: the walk starts at the range's top, so the prefix's exclusive
+     * byte-successor is needed as the upper bound — otherwise the reverse start
+     * would land on the namespace's greatest key, outside the prefix, and the
+     * in-loop prefix check would stop the scan before it produced anything. An
+     * all-0xFF prefix has no successor, but nothing sorts above it either, so
+     * leaving the upper end unbounded (reverse start == namespace end) is exact.
      */
+    if (reverse && prefix_size != 0U) {
+        successor = (uint8_t *)malloc(prefix_size);
+        if (successor == NULL) {
+            return SDB_E_OUT_OF_MEMORY;
+        }
+        if (sdb_prefix_successor(
+                prefix, prefix_size, successor, &successor_size
+            )) {
+            cursor_options.upper_bound = successor;
+            cursor_options.upper_bound_size = successor_size;
+        }
+    }
+    status = sdb_snapshot_open(database, &snapshot);
+    if (status != SDB_OK) {
+        free(successor);
+        return status;
+    }
     cursor_options.lower_bound = prefix_size != 0U ? prefix : NULL;
     cursor_options.lower_bound_size = prefix_size;
+    cursor_options.reverse = reverse;
     if (options != NULL) {
         cursor_options.limit = options->limit;
     }
@@ -6629,6 +6689,8 @@ sdb_status sdb_kv_scan_prefix(
         snapshot, SDB_KEYSPACE_KV, namespace_name, namespace_size,
         &cursor_options, &cursor
     );
+    /* Bounds are copied into cursor storage at open time. */
+    free(successor);
     if (status == SDB_OK) {
         status = sdb_cursor_first(cursor);
     }

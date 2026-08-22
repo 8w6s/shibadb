@@ -97,11 +97,17 @@ the new `sdb_validate_superblock_detailed` helper.
 
 ## Known preset-artifact failures under `coverage`
 
-- **`abi_symbols`** — `libshibadb.so.1.0.0` under the coverage preset
-  contains an extra `__llvm_write_custom_profile` symbol from the LLVM
-  coverage runtime. The check-symbols script does not know to ignore
-  it. Under the `clang` preset the exported symbol set matches
-  `abi/symbols-v1.txt` exactly. Not a regression caused by this session.
+- **`abi_symbols`** — *fixed since this snapshot.* Under the coverage
+  preset `libshibadb.so.1.0.0` contains an extra
+  `__llvm_write_custom_profile` symbol from the LLVM coverage runtime,
+  which the check-symbols script compared literally and failed on.
+  `tests/check_symbols.cmake` now filters toolchain-runtime symbols by
+  prefix (`__llvm_*`, `__gcov*`, `__asan_*`, …), so the coverage and
+  sanitizer presets check the ShibaDB surface as strictly as a plain
+  build instead of failing. The test is also registered in CTest again
+  (it had been dropped from `CMakeLists.txt`) and now reads PE and
+  Mach-O exports as well as ELF, so it runs everywhere except MSVC
+  (see `docs/ABI.md`).
 - **`release_audit`** — `scripts/release_audit.py` requires evidence
   paths configured through environment variables that only exist in the
   release-CI environment. Fails in every developer build; not a

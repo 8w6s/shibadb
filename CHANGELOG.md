@@ -10,6 +10,24 @@ frozen at v1.0.
 Performance and durability hardening on top of the `v1.0.0-rc*` line. The
 C ABI and on-disk format remain frozen at v1.0.
 
+### Added
+- **Reverse prefix scan (`sdb_scan_options.reverse`).** `sdb_kv_scan_prefix`
+  now honours the `reverse` flag it previously rejected, walking the prefix
+  range in descending key order. The direction is applied inside the walk, so
+  `reverse` combined with `limit` returns the *greatest* n matches rather than
+  the smallest n reversed. A reverse prefix scan derives the prefix's exclusive
+  byte-successor as the range's upper edge; an all-`0xFF` prefix has no
+  successor and correctly starts at the namespace end. `prefix_size` is now
+  explicitly capped at `SDB_ENGINE_MAX_NAME_SIZE`. No new symbols and no struct
+  changes — the flag and its reserved padding already existed.
+- **`shibadb scan --reverse`.** The native CLI exposes the flag, composing with
+  `--prefix` and `--limit`.
+- **Python `Database.scan(..., reverse=, limit=)`.** Both options are passed
+  through a new `_ScanOptions` ctypes mirror of `sdb_scan_options` instead of
+  reversing the result list in Python, so `reverse` and `limit` now compose
+  correctly and `limit` bounds the engine's work. A negative limit raises
+  `ValueError`. `python -m shibadb.cli … scan` gains `--reverse` and `--limit`.
+
 ### Performance
 - **Opt-in relaxed durability (`SDB_SYNCHRONOUS_NORMAL`).** A new `synchronous`
   field on `sdb_database_options` (default `SDB_SYNCHRONOUS_FULL`, unchanged
@@ -62,16 +80,55 @@ C ABI and on-disk format remain frozen at v1.0.
   `SDB_POWERLOSS_LIBRARY`, preventing a release check from silently exercising
   a stale hard-coded build directory. Commit `d76f6ab` contains the original
   gate; the configurable-library hardening is in the current tree.
-- **Python binding wired into CTest (`python_binding`).** The Python
-  binding is back **in-tree** (`python/`) and is now exercised by the
-  suite (it had earlier been moved out of tree; see the rc1 entry below).
-  The current working tree registers 53 tests, including legacy encrypted
-  fixture, index-reclamation compatibility, installed C/C++ consumers, and an
-  isolated wheel-install conformance test.
+- **Python binding wired into CTest (`python_*`).** The Python binding is back
+  **in-tree** (`python/`) and is exercised by the suite (it had earlier been
+  moved out of tree; see the rc1 entry below). *Correction:* an earlier revision
+  of this entry claimed a `python_binding` test and a 53-test total; neither was
+  true of the tree it described — no Python test was registered at all. The
+  binding suites are registered as of the current entry under "Testing" below.
 - **Packaging gates are now part of CTest.** The previously dormant external
-  install-consumer and Python wheel scripts are registered as serial packaging
-  tests. Enabling the gate exposed and fixed a stale `find_package(ShibaDB
-  0.1)` requirement after the package version moved to 1.0.
+  install-consumer script is registered as a serial packaging test. Enabling the
+  gate exposed and fixed a stale `find_package(ShibaDB 0.1)` requirement after
+  the package version moved to 1.0. *Correction:* `tests/test_python_wheel.cmake`
+  is still NOT registered — it invokes `tests/test_python_binding.py`, which does
+  not exist in the tree, so the wheel-install conformance gate remains unbuilt
+  rather than dormant-but-working.
+- **ABI symbol allowlist re-gated (`abi_symbols`).** `tests/check_symbols.cmake`
+  existed but was no longer registered with CTest, so nothing enforced
+  `abi/symbols-v1.txt` — and the allowlist had drifted 20 symbols behind the
+  headers (the whole cursor/snapshot/scan surface, plus `sdb_list_namespaces`,
+  `sdb_database_migrate_file`, and `sdb_version_number`). The allowlist is
+  brought up to date and the test registered again. The checker now picks its
+  extractor from the library's object format — `objdump -p` for PE export
+  directories, `nm` for ELF and for Mach-O (stripping the leading underscore) —
+  so the gate covers Linux, macOS, and MinGW instead of ELF alone; only MSVC,
+  which ships neither tool, is skipped. Toolchain-runtime symbols (`__llvm_*`,
+  `__gcov*`, `__asan_*`, …) are filtered by prefix so the coverage and sanitizer
+  presets are gated as strictly as a plain build rather than failing on an
+  injected profile symbol (see `docs/COVERAGE.md`); a read that yields no
+  symbols now fails instead of passing vacuously. Mismatches report just the
+  differing symbols rather than two full lists. `tests/test_abi.c` also pins
+  `sdb_scan_options`' size and field offsets, which the Python binding mirrors
+  by hand.
+- **Python and packaging suites registered with CTest (`python_*`).** Five
+  standalone scripts under `tests/` were never referenced by `CMakeLists.txt`,
+  and the drift that followed is what a gate exists to prevent:
+  `tests/test_security_bundle.py` still asserted the `shibadb-0.1.0-*` artifact
+  names long after `scripts/package_release.py` moved to `1.0.0`, so it failed
+  the moment it was run. The assertions now derive the names from
+  `package_release.PREFIX`, and the scan/polyglot/legacy-fixture/release-evidence
+  /security-bundle suites run under CTest whenever a Python interpreter is
+  found.
+- **Python package version realigned with the library.** `shibadb.__version__`
+  and `python/build_wheel.py`'s `VERSION` both still read `0.1.0` while
+  `SDB_VERSION_STRING` was `1.0.0`, so the wheel published a version that did
+  not match the ABI it wraps. Both now track the native version, and
+  `tests/test_scan_query.py` asserts the three constants agree.
+- **`install_consumer` fixed on MinGW.** The test hard-coded `shibadb.dll` when
+  staging the installed library beside the external consumer, but a MinGW build
+  installs `libshibadb.dll`, so the test failed for every non-MSVC Windows
+  build with a bare "file COPY cannot find" error. The runtime file name is now
+  passed in from the target, and a missing DLL reports what was expected where.
 
 ### Portability
 - **Windows I/O and locking repaired.** Database identity exclusion now uses a

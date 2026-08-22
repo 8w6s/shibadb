@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 ABI_VERSION = 1
 
 _u8 = ctypes.c_uint8
@@ -82,6 +82,18 @@ class _CompactResult(ctypes.Structure):
         ("byte_count_after", ctypes.c_uint64),
         ("raw_entries_before", ctypes.c_uint64),
         ("raw_entries_after", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 4),
+    ]
+
+class _ScanOptions(ctypes.Structure):
+    # Mirrors sdb_scan_options in include/shibadb_engine.h. reserved_alignment
+    # pads `reverse` out to the 8-byte alignment of `limit`, so the layout is
+    # explicit here rather than left to the compiler.
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("reverse", ctypes.c_bool),
+        ("reserved_alignment", ctypes.c_uint8 * 3),
+        ("limit", ctypes.c_uint64),
         ("reserved", ctypes.c_uint64 * 4),
     ]
 
@@ -253,7 +265,7 @@ _lib.sdb_database_migrate.argtypes = [
 _lib.sdb_database_migrate.restype = ctypes.c_int
 _lib.sdb_kv_scan_prefix.argtypes = [
     _database_p, _u8_p, ctypes.c_size_t, _u8_p, ctypes.c_size_t,
-    ctypes.c_void_p, _SCAN_VISITOR, ctypes.c_void_p,
+    ctypes.POINTER(_ScanOptions), _SCAN_VISITOR, ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_size_t),
 ]
 _lib.sdb_kv_scan_prefix.restype = ctypes.c_int
@@ -593,13 +605,17 @@ class Database:
         return found
 
     def scan(
-        self, namespace, prefix=b"", *, reverse: bool = False
+        self, namespace, prefix=b"", *, reverse: bool = False, limit: int = 0
     ) -> list[tuple[bytes, bytes]]:
         """Return (key, value) pairs of the KV namespace whose key begins with
         prefix (an empty prefix scans the whole namespace), in ascending key
-        order — or descending if reverse is set. The scan holds a read snapshot
-        for its duration, so it excludes writers on this handle until it
-        returns."""
+        order — or descending if reverse is set. limit caps the number of pairs
+        (0 = unlimited); because the direction is applied natively, limit with
+        reverse returns the GREATEST limit keys, not the smallest ones flipped.
+        The scan holds a read snapshot for its duration, so it excludes writers
+        on this handle until it returns."""
+        if limit < 0:
+            raise ValueError("limit must be >= 0 (0 means unlimited)")
         namespace_bytes = _bytes(namespace)
         prefix_bytes = _bytes(prefix)
         namespace_store, namespace_ptr = _buffer(namespace_bytes)
@@ -615,19 +631,27 @@ class Database:
             ))
             return True
 
+        # struct_size is stamped from the mirror's own sizeof, NOT via
+        # sdb_scan_options_init: that helper memsets sizeof(sdb_scan_options)
+        # bytes as the LIBRARY defines it, which would overrun this buffer if a
+        # future library grew the struct. The layout is frozen for ABI v1 (the
+        # binding refuses a mismatched sdb_abi_version at import), and
+        # tests/test_abi.c static-asserts the size this mirror assumes.
+        options = _ScanOptions()
+        options.struct_size = ctypes.sizeof(_ScanOptions)
+        options.reverse = reverse
+        options.limit = limit
         match_count = ctypes.c_size_t()
         status = _lib.sdb_kv_scan_prefix(
             self._require_open(),
             namespace_ptr, len(namespace_bytes),
             prefix_ptr, len(prefix_bytes),
-            None, visitor, None, ctypes.byref(match_count),
+            ctypes.byref(options), visitor, None, ctypes.byref(match_count),
         )
         del namespace_store, prefix_store
         _raise_status(status)
         if match_count.value != len(results):
             raise RuntimeError("native scan callback count mismatch")
-        if reverse:
-            results.reverse()
         return results
 
     def find_query(

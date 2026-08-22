@@ -600,6 +600,59 @@ if(SDB_BUILD_TESTS)
         endforeach()
     endif()
     add_test(NAME abi COMMAND test_abi)
+    # Freeze the shared library's exported symbol table against
+    # abi/symbols-v1.txt (docs/ABI.md calls this the authoritative allowlist).
+    # Hidden visibility means an unexpected export is a real leak and a missing
+    # one is an ABI break, so the gate runs on every platform we ship: PE needs
+    # objdump (a DLL has no dynamic table for `nm -D`), ELF and Mach-O need nm.
+    # MSVC provides neither, so there the gate is skipped with a status line
+    # rather than registered as a test that could never pass.
+    if(MSVC)
+        set(SDB_SYMBOL_TOOL_ARGS "")
+        message(STATUS
+            "ShibaDB: MSVC toolchain (no nm/objdump); "
+            "skipping the abi_symbols test")
+    elseif(WIN32)
+        # CMAKE_OBJDUMP is set by CMake for the GNU/Clang toolchains; fall back
+        # to a PATH lookup so a toolchain that leaves it empty still gets the
+        # coverage.
+        set(SDB_OBJDUMP "${CMAKE_OBJDUMP}")
+        if(NOT SDB_OBJDUMP)
+            find_program(SDB_OBJDUMP_PROGRAM NAMES objdump llvm-objdump)
+            set(SDB_OBJDUMP "${SDB_OBJDUMP_PROGRAM}")
+        endif()
+        if(SDB_OBJDUMP)
+            set(SDB_SYMBOL_TOOL_ARGS -DOBJDUMP=${SDB_OBJDUMP})
+        else()
+            set(SDB_SYMBOL_TOOL_ARGS "")
+            message(STATUS
+                "ShibaDB: objdump not found; skipping the abi_symbols test")
+        endif()
+    else()
+        set(SDB_NM "${CMAKE_NM}")
+        if(NOT SDB_NM)
+            find_program(SDB_NM_PROGRAM NAMES nm llvm-nm)
+            set(SDB_NM "${SDB_NM_PROGRAM}")
+        endif()
+        if(SDB_NM)
+            set(SDB_SYMBOL_TOOL_ARGS -DNM=${SDB_NM})
+        else()
+            set(SDB_SYMBOL_TOOL_ARGS "")
+            message(STATUS
+                "ShibaDB: nm not found; skipping the abi_symbols test")
+        endif()
+    endif()
+    if(SDB_SYMBOL_TOOL_ARGS)
+        add_test(
+            NAME abi_symbols
+            COMMAND ${CMAKE_COMMAND}
+                ${SDB_SYMBOL_TOOL_ARGS}
+                -DLIBRARY=$<TARGET_FILE:shibadb_shared>
+                -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/abi/symbols-v1.txt
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols.cmake
+        )
+        set_tests_properties(abi_symbols PROPERTIES LABELS packaging)
+    endif()
     add_test(NAME superblock COMMAND test_superblock)
     add_test(NAME database_info COMMAND test_database_info)
     add_test(NAME convenience COMMAND test_convenience)
@@ -698,6 +751,7 @@ if(SDB_BUILD_TESTS)
             -DINSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/test-install-prefix
             -DGENERATOR=${CMAKE_GENERATOR}
             -DCONFIG=$<CONFIG>
+            -DRUNTIME_NAME=$<TARGET_FILE_NAME:shibadb_shared>
             -P ${CMAKE_CURRENT_BINARY_DIR}/test_install_consumer.cmake
     )
 
@@ -716,6 +770,60 @@ if(SDB_BUILD_TESTS)
                 -DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}/_cli_work
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.cmake
         )
+    endif()
+    # The Python-side suites are standalone scripts (no pytest): each exits
+    # non-zero on failure, so CTest can drive them directly. They were left
+    # unregistered, and the drift that followed is exactly what a gate exists to
+    # stop -- tests/test_security_bundle.py still asserted the 0.1.0 artifact
+    # names long after package_release.py moved to 1.0.0, and nothing failed.
+    # Registered only when a Python 3 interpreter is available so a C-only
+    # toolchain still configures.
+    find_program(SDB_PYTHON NAMES python3 python)
+    if(SDB_PYTHON)
+        # A sanitizer build's shared library pulls in the ASan/TSan runtime,
+        # which refuses to initialize when dlopen'd late by an uninstrumented
+        # host ("ASan runtime does not come first in initial library list").
+        # dlopen is exactly what ctypes does, so the binding suites cannot run
+        # against those builds; the packaging scripts, which never load the
+        # library, still can.
+        if(SDB_ENABLE_SANITIZERS OR SDB_ENABLE_THREAD_SANITIZER)
+            set(sdb_binding_tests "")
+            message(STATUS
+                "ShibaDB: sanitizer build; skipping the ctypes binding tests "
+                "(the runtime cannot be dlopen'd by an uninstrumented python)")
+        else()
+            set(sdb_binding_tests scan_query polyglot legacy_fixture)
+        endif()
+        foreach(sdb_py_test IN LISTS sdb_binding_tests)
+            add_test(
+                NAME python_${sdb_py_test}
+                COMMAND ${CMAKE_COMMAND} -E env
+                    "SHIBADB_LIBRARY=$<TARGET_FILE:shibadb_shared>"
+                    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+                    ${SDB_PYTHON}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${sdb_py_test}.py
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            )
+            set_tests_properties(python_${sdb_py_test} PROPERTIES
+                LABELS python
+            )
+        endforeach()
+        # Packaging/evidence scripts read the source tree only -- no library, no
+        # PYTHONPATH (they insert scripts/ themselves).
+        foreach(sdb_py_test release_evidence security_bundle)
+            add_test(
+                NAME python_${sdb_py_test}
+                COMMAND ${SDB_PYTHON}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${sdb_py_test}.py
+                WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            )
+            set_tests_properties(python_${sdb_py_test} PROPERTIES
+                LABELS packaging
+            )
+        endforeach()
+    else()
+        message(STATUS
+            "ShibaDB: no Python interpreter; skipping the python_* tests")
     endif()
     if(SDB_BUILD_EXAMPLES)
         add_test(NAME example_quickstart COMMAND example_quickstart)

@@ -188,6 +188,277 @@ static void test_scan_prefix(void)
 }
 
 /*
+ * Reverse prefix scan: the sugar walks the prefix range in descending key
+ * order, and a limit takes the LAST n matches rather than the first n
+ * reversed. An empty prefix reverses the whole namespace.
+ */
+static void test_scan_prefix_reverse(void)
+{
+    static const char *path = "test-scan-prefix-rev.tmp";
+    sdb_database_options opt;
+    sdb_database *db = NULL;
+    sdb_scan_options sopt;
+    struct pairs got;
+    size_t count = 0U;
+
+    remove_db(path);
+    sdb_database_options_init(&opt);
+    assert(sdb_database_create(path, &opt, &db) == SDB_OK);
+    put(db, NS, 2U, "post:1", "hello");
+    put(db, NS, 2U, "user:1", "alice");
+    put(db, NS, 2U, "user:2", "bob");
+    put(db, NS, 2U, "user:3", "carol");
+
+    /* descending over the prefix range */
+    got.n = 0U;
+    sdb_scan_options_init(&sopt);
+    sopt.reverse = true;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, (const uint8_t *)"user:", 5U,
+        &sopt, scan_collector, &got, &count) == SDB_OK);
+    assert(count == 3U && got.n == 3U);
+    assert(strcmp(got.key[0], "user:3") == 0 && strcmp(got.val[0], "carol") == 0);
+    assert(strcmp(got.key[1], "user:2") == 0);
+    assert(strcmp(got.key[2], "user:1") == 0);
+
+    /* reverse + limit yields the greatest n matches, not the first n flipped */
+    got.n = 0U;
+    count = 0U;
+    sdb_scan_options_init(&sopt);
+    sopt.reverse = true;
+    sopt.limit = 2U;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, (const uint8_t *)"user:", 5U,
+        &sopt, scan_collector, &got, &count) == SDB_OK);
+    assert(count == 2U && got.n == 2U);
+    assert(strcmp(got.key[0], "user:3") == 0);
+    assert(strcmp(got.key[1], "user:2") == 0);
+
+    /* forward + limit still takes the smallest n (the reverse flag is the only
+     * difference) */
+    got.n = 0U;
+    count = 0U;
+    sdb_scan_options_init(&sopt);
+    sopt.limit = 2U;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, (const uint8_t *)"user:", 5U,
+        &sopt, scan_collector, &got, &count) == SDB_OK);
+    assert(count == 2U && got.n == 2U);
+    assert(strcmp(got.key[0], "user:1") == 0);
+    assert(strcmp(got.key[1], "user:2") == 0);
+
+    /* empty prefix reverses the whole namespace */
+    got.n = 0U;
+    count = 0U;
+    sdb_scan_options_init(&sopt);
+    sopt.reverse = true;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, NULL, 0U,
+        &sopt, scan_collector, &got, &count) == SDB_OK);
+    assert(count == 4U && got.n == 4U);
+    assert(strcmp(got.key[0], "user:3") == 0);
+    assert(strcmp(got.key[3], "post:1") == 0);
+
+    assert(sdb_database_close(db) == SDB_OK);
+    remove_db(path);
+}
+
+/*
+ * A reverse prefix scan needs the prefix's byte-successor as the range's upper
+ * edge. An all-0xFF prefix has no successor (incrementing carries off the end),
+ * so the walk must fall back to the namespace end instead of computing a bogus
+ * bound and dropping every match.
+ */
+static void test_scan_prefix_reverse_max_prefix(void)
+{
+    static const char *path = "test-scan-prefix-rev-ff.tmp";
+    static const uint8_t k_ff_01[2] = {0xFFU, 0x01U};
+    static const uint8_t k_ff_02[2] = {0xFFU, 0x02U};
+    static const uint8_t k_fe[1] = {0xFEU};
+    static const uint8_t prefix_ff[1] = {0xFFU};
+    sdb_database_options opt;
+    sdb_database *db = NULL;
+    sdb_scan_options sopt;
+    struct pairs got;
+    size_t count = 0U;
+
+    remove_db(path);
+    sdb_database_options_init(&opt);
+    assert(sdb_database_create(path, &opt, &db) == SDB_OK);
+    assert(sdb_kv_put(db, NS, 2U, k_fe, sizeof(k_fe),
+        (const uint8_t *)"n", 1U) == SDB_OK);
+    assert(sdb_kv_put(db, NS, 2U, k_ff_01, sizeof(k_ff_01),
+        (const uint8_t *)"a", 1U) == SDB_OK);
+    assert(sdb_kv_put(db, NS, 2U, k_ff_02, sizeof(k_ff_02),
+        (const uint8_t *)"b", 1U) == SDB_OK);
+
+    got.n = 0U;
+    sdb_scan_options_init(&sopt);
+    sopt.reverse = true;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, prefix_ff, sizeof(prefix_ff),
+        &sopt, scan_collector, &got, &count) == SDB_OK);
+    /* only the two 0xFF-prefixed keys, descending; the 0xFE key is excluded */
+    assert(count == 2U && got.n == 2U);
+    assert(memcmp(got.key[0], k_ff_02, sizeof(k_ff_02)) == 0);
+    assert(memcmp(got.key[1], k_ff_01, sizeof(k_ff_01)) == 0);
+
+    assert(sdb_database_close(db) == SDB_OK);
+    remove_db(path);
+}
+
+/*
+ * Differential property: for many random key sets and prefixes, a reverse scan
+ * must yield exactly the forward scan's matches in the opposite order AND be
+ * strictly descending, and reverse+limit must return the GREATEST `limit` of
+ * them. Random multi-leaf trees are what caught the earlier right-sibling
+ * desync, so the property is asserted over generated data rather than over one
+ * hand-written fixture.
+ */
+static uint32_t reverse_rng_state = 0x12345678U;
+
+static uint32_t reverse_rng(void)
+{
+    reverse_rng_state ^= reverse_rng_state << 13;
+    reverse_rng_state ^= reverse_rng_state >> 17;
+    reverse_rng_state ^= reverse_rng_state << 5;
+    return reverse_rng_state;
+}
+
+/* Wider than struct pairs: these rounds hold up to a few hundred keys. */
+struct scan_keys {
+    char key[400][32];
+    size_t n;
+};
+
+static bool scan_key_collector(void *context, const uint8_t *key,
+    size_t key_size, const uint8_t *value, size_t value_size)
+{
+    struct scan_keys *out = (struct scan_keys *)context;
+    (void)value;
+    (void)value_size;
+    assert(out->n < 400U);
+    assert(key_size < 32U);
+    (void)memcpy(out->key[out->n], key, key_size);
+    out->key[out->n][key_size] = '\0';
+    out->n += 1U;
+    return true;
+}
+
+static void scan_keys_collect(sdb_database *db, const char *prefix,
+    size_t prefix_size, bool reverse, uint64_t limit, struct scan_keys *out)
+{
+    sdb_scan_options options;
+    out->n = 0U;
+    sdb_scan_options_init(&options);
+    options.reverse = reverse;
+    options.limit = limit;
+    assert(sdb_kv_scan_prefix(
+        db, NS, 2U,
+        prefix_size != 0U ? (const uint8_t *)prefix : NULL, prefix_size,
+        &options, scan_key_collector, out, NULL
+    ) == SDB_OK);
+}
+
+static void test_scan_prefix_reverse_mirrors_forward(void)
+{
+    static const char *path = "test-scan-prefix-rev-prop.tmp";
+    sdb_database_options opt;
+    sdb_database *db = NULL;
+    struct scan_keys forward;
+    struct scan_keys reverse;
+    struct scan_keys limited;
+    char prefix[3];
+    size_t prefix_size;
+    size_t keys;
+    size_t i;
+    int round;
+
+    for (round = 0; round < 12; ++round) {
+        remove_db(path);
+        sdb_database_options_init(&opt);
+        assert(sdb_database_create(path, &opt, &db) == SDB_OK);
+        keys = 50U + (size_t)(reverse_rng() % 250U);
+        for (i = 0; i < keys; ++i) {
+            char k[24];
+            (void)snprintf(k, sizeof(k), "%c%c%04u",
+                (char)('a' + (reverse_rng() % 4U)),
+                (char)('a' + (reverse_rng() % 4U)),
+                (unsigned)(reverse_rng() % 9999U));
+            put(db, NS, 2U, k, "x");
+        }
+        prefix_size = (size_t)(reverse_rng() % 3U);
+        prefix[0] = (char)('a' + (reverse_rng() % 4U));
+        prefix[1] = (char)('a' + (reverse_rng() % 4U));
+        prefix[2] = '\0';
+
+        scan_keys_collect(db, prefix, prefix_size, false, 0U, &forward);
+        scan_keys_collect(db, prefix, prefix_size, true, 0U, &reverse);
+        assert(reverse.n == forward.n);
+        for (i = 0; i < forward.n; ++i) {
+            assert(strcmp(forward.key[i], reverse.key[forward.n - 1U - i])
+                == 0);
+        }
+        /* Strictly descending, so the order is real and not an artifact of
+         * insertion order. */
+        for (i = 1U; i < reverse.n; ++i) {
+            assert(strcmp(reverse.key[i - 1U], reverse.key[i]) > 0);
+        }
+        if (forward.n > 2U) {
+            uint64_t limit =
+                (uint64_t)(1U + (reverse_rng() % (unsigned)(forward.n - 1U)));
+            scan_keys_collect(db, prefix, prefix_size, true, limit, &limited);
+            assert(limited.n == (size_t)limit);
+            for (i = 0; i < limited.n; ++i) {
+                assert(strcmp(limited.key[i], reverse.key[i]) == 0);
+            }
+        }
+        assert(sdb_database_close(db) == SDB_OK);
+    }
+    remove_db(path);
+}
+
+/*
+ * The prefix bound is checked before the reverse path copies it into a
+ * successor buffer, so an oversized prefix is refused in BOTH directions and
+ * the exact maximum is still accepted (off-by-one guard on the copy).
+ */
+static void test_scan_prefix_size_bound(void)
+{
+    static const char *path = "test-scan-prefix-bound.tmp";
+    sdb_database_options opt;
+    sdb_database *db = NULL;
+    sdb_scan_options options;
+    static uint8_t oversized[SDB_ENGINE_MAX_NAME_SIZE + 1];
+    struct scan_keys got;
+    size_t count = 123U;
+
+    remove_db(path);
+    sdb_database_options_init(&opt);
+    assert(sdb_database_create(path, &opt, &db) == SDB_OK);
+    put(db, NS, 2U, "a", "1");
+    (void)memset(oversized, 'x', sizeof(oversized));
+
+    sdb_scan_options_init(&options);
+    options.reverse = true;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, oversized, sizeof(oversized),
+        &options, scan_key_collector, &got, &count) == SDB_E_INVALID_ARGUMENT);
+    /* Rejected before the out-param is touched. */
+    assert(count == 123U);
+
+    sdb_scan_options_init(&options);
+    assert(sdb_kv_scan_prefix(db, NS, 2U, oversized, sizeof(oversized),
+        &options, scan_key_collector, &got, &count) == SDB_E_INVALID_ARGUMENT);
+    assert(count == 123U);
+
+    /* Exactly at the cap is legal (and simply matches nothing here). */
+    got.n = 0U;
+    sdb_scan_options_init(&options);
+    options.reverse = true;
+    assert(sdb_kv_scan_prefix(db, NS, 2U, oversized, SDB_ENGINE_MAX_NAME_SIZE,
+        &options, scan_key_collector, &got, &count) == SDB_OK);
+    assert(count == 0U && got.n == 0U);
+
+    assert(sdb_database_close(db) == SDB_OK);
+    remove_db(path);
+}
+
+/*
  * A cursor must not outlive its snapshot: closing the snapshot while a cursor
  * is still open is refused with SDB_E_BUSY (else a writer could mutate the tree
  * under the live cursor, or the handle could be torn down beneath it). Closing
@@ -455,6 +726,10 @@ int main(void)
     test_cursor_kv_forward();
     test_snapshot_blocks_writer();
     test_scan_prefix();
+    test_scan_prefix_reverse();
+    test_scan_prefix_reverse_max_prefix();
+    test_scan_prefix_reverse_mirrors_forward();
+    test_scan_prefix_size_bound();
     test_snapshot_close_refused_while_cursor_open();
     test_cursor_limit_and_seek_reset();
     test_list_namespaces();

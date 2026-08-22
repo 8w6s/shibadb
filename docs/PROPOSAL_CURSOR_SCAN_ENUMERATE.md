@@ -1,6 +1,13 @@
 # ShibaDB-C Public Cursor, Scan, and Enumerate API
 
-**Status:** Proposal (revision 3, Track A adaptation for single-mutex model)
+**Status:** Proposal (revision 3, Track A adaptation for single-mutex model).
+Partially shipped: read snapshots, KV cursors in both directions,
+`sdb_kv_scan_prefix` (forward and reverse, with `limit`), and
+`sdb_list_namespaces` are implemented — see `docs/ENGINE_API.md`. Range scans,
+transactional scans, blob/collection enumeration, `sdb_cursor_last` / `_prev` /
+`_seek_exact` / `_dup`, and the `sdb_list_*_into` fill-buffer forms remain
+unimplemented; the shipped subset's cursor is reverse-capable via
+`sdb_cursor_options.reverse` rather than a separate `_prev` entry point.
 **Audience:** ShibaDB-C library authors and consumers
 **ABI impact:** Append-only. No changes to existing `SDB_API` declarations. All new symbols are additive and covered by `SDB_ENGINE_API_VERSION = 1`.
 

@@ -61,6 +61,36 @@ def test_scan_and_find_query() -> None:
             prefixed = db.scan("users", b"user:")
             assert [k for k, _ in prefixed] == [b"user:1", b"user:2"]
 
+            # reverse scan: descending key order, done natively
+            rev = db.scan("users", reverse=True)
+            assert [k for k, _ in rev] == [b"user:2", b"user:1", b"post:1"]
+
+            # limit truncates; forward takes the smallest, reverse the greatest
+            assert [k for k, _ in db.scan("users", limit=2)] == [
+                b"post:1",
+                b"user:1",
+            ]
+            assert [k for k, _ in db.scan("users", limit=2, reverse=True)] == [
+                b"user:2",
+                b"user:1",
+            ]
+
+            # reverse composes with a prefix
+            assert [
+                k for k, _ in db.scan("users", b"user:", reverse=True)
+            ] == [b"user:2", b"user:1"]
+
+            # limit=0 means unlimited (the C default), not "no rows"
+            assert len(db.scan("users", limit=0)) == 3
+
+            # a negative limit is a caller error, not silently clamped
+            try:
+                db.scan("users", limit=-1)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("negative limit must raise ValueError")
+
             # find_query: client-side JSON filter over the ordered scan
             found = db.find_query("users", {"age": {"$gte": 30}})
             assert len(found) == 1
@@ -111,11 +141,38 @@ def test_list_namespaces() -> None:
         print("list_namespaces: ok")
 
 
+
+
+def test_binding_version_tracks_native() -> None:
+    """The binding's __version__, the wheel's VERSION and the native
+    sdb_version_string() all name the same release. They are three separate
+    hard-coded constants, so nothing but a check keeps them together: the
+    security-review bundle test already drifted to a stale 0.1.0 this way."""
+    native = shibadb.version()
+    assert shibadb.__version__ == native, (
+        f"binding __version__={shibadb.__version__} != native {native}"
+    )
+
+    wheel_source = (
+        Path(__file__).resolve().parents[1] / "python" / "build_wheel.py"
+    ).read_text(encoding="utf-8")
+    for line in wheel_source.splitlines():
+        if line.startswith("VERSION = "):
+            wheel_version = line.split("=", 1)[1].strip().strip('"')
+            break
+    else:
+        raise AssertionError("build_wheel.py has no VERSION assignment")
+    assert wheel_version == native, (
+        f"wheel VERSION={wheel_version} != native {native}"
+    )
+    print("binding/wheel/native version agreement: ok")
+
 def main() -> None:
     test_matcher_operators()
     test_scan_and_find_query()
     test_resolve_ref()
     test_list_namespaces()
+    test_binding_version_tracks_native()
     print("scan/query python: ok")
 
 

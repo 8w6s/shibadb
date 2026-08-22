@@ -120,9 +120,15 @@ jobs:
             platform: Windows
     steps:
       - uses: actions/checkout@v4
-      # The native ctest suite is pure C now (the Python binding was removed),
-      # so no Python is needed here. Windows uses the Ninja generator, which
-      # needs the MSVC toolchain on PATH — set it up via the dev-cmd action.
+      # The Python suites (python_* in CTest) are registered only when an
+      # interpreter is found, so set one up: without it those tests silently
+      # vanish and this matrix would report green on an untested binding.
+      # Windows uses the Ninja generator, which needs the MSVC toolchain on
+      # PATH — set it up via the dev-cmd action.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1

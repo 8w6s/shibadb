@@ -11,7 +11,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from package_release import main as package_main
+from package_release import PREFIX, main as package_main
 from verify_security_bundle import verify
 
 with tempfile.TemporaryDirectory() as directory:
@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory() as directory:
     finally:
         sys.argv = original_argv
 
-    bundle = output / "shibadb-0.1.0-security-review.zip"
+    bundle = output / f"{PREFIX}-security-review.zip"
     manifest = verify(bundle)
     assert manifest["commit"] == "a" * 40
     assert {"cryptography", "crash-consistency"}.issubset(
@@ -60,9 +60,9 @@ with tempfile.TemporaryDirectory() as directory:
         raise AssertionError("tampered bundle passed verification")
 
     sums = (output / "SHA256SUMS").read_text(encoding="ascii")
-    assert "shibadb-0.1.0-security-review.zip" in sums
+    assert f"{PREFIX}-security-review.zip" in sums
     spdx = json.loads(
-        (output / "shibadb-0.1.0.spdx.json").read_text(encoding="utf-8")
+        (output / f"{PREFIX}.spdx.json").read_text(encoding="utf-8")
     )
     assert spdx["spdxVersion"] == "SPDX-2.3"
 

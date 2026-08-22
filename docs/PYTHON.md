@@ -49,6 +49,17 @@ also be UTF-8 `str`. Native status codes are mapped to Python exceptions such
 as `NotFoundError`, `ConflictError`, `BusyError`, and
 `AuthenticationError`.
 
+`Database.scan(namespace, prefix=b"", *, reverse=False, limit=0)` returns the
+`(key, value)` pairs whose key begins with `prefix` (an empty prefix walks the
+whole namespace). Both `reverse` and `limit` are passed to the native
+`sdb_kv_scan_prefix` through an `sdb_scan_options` struct rather than applied in
+Python, so `limit` bounds the work the engine does and `reverse` with `limit`
+returns the *greatest* n keys — not the smallest n reversed, which is what
+reversing the returned list would give. `limit=0` means unlimited; a negative
+limit raises `ValueError`. The scan holds a read snapshot for its duration, so it
+excludes writers on that handle until it returns. The bundled
+`python -m shibadb.cli … scan` exposes both as `--reverse` and `--limit`.
+
 Encrypted create, compact, and migration operations default to 600,000
 PBKDF2-HMAC-SHA256 iterations. Applications may pass `kdf_iterations`
 explicitly after benchmarking their target hardware.

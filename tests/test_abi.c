@@ -35,6 +35,22 @@ _Static_assert(
 #error Unsupported size_t width
 #endif
 
+/*
+ * sdb_scan_options is mirrored by hand as a ctypes.Structure in
+ * python/shibadb/__init__.py, which stamps struct_size from its own sizeof.
+ * Pin the layout here so growing the struct fails this test rather than
+ * silently overrunning the binding's buffer.
+ */
+_Static_assert(sizeof(sdb_scan_options) == 48U, "scan options ABI changed");
+_Static_assert(
+    offsetof(sdb_scan_options, reverse) == 4U,
+    "scan options reverse offset changed"
+);
+_Static_assert(
+    offsetof(sdb_scan_options, limit) == 8U,
+    "scan options limit offset changed"
+);
+
 _Static_assert(sizeof(sdb_verify_result) == 104U, "verify ABI changed");
 _Static_assert(sizeof(sdb_backup_result) == 40U, "backup ABI changed");
 _Static_assert(sizeof(sdb_compact_result) == 64U, "compact ABI changed");

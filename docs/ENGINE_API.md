@@ -113,6 +113,23 @@ on it remains open. `sdb_kv_scan_prefix` is the auto-commit convenience wrapper
 distinct `(keyspace_kind, namespace)` pairs that hold data, each once — the
 "list the tables" primitive.
 
+Direction is a property of the iterator, not of the seek. Setting `reverse` on
+`sdb_cursor_options` (or on `sdb_scan_options` for the sugar) makes
+`sdb_cursor_first` land on the range's **greatest** entry and `sdb_cursor_next`
+step down toward its least; the range stays the same half-open
+`[lower, upper)`, so a reverse walk starts at the last key strictly below
+`upper_bound` and stops once it falls below `lower_bound`. `sdb_cursor_seek`
+keeps lower-bound semantics in both directions.
+
+Because the direction is applied inside the walk, `limit` composes with it the
+way callers expect: `reverse` plus `limit = n` returns the **greatest** n
+matches, not the smallest n reversed — which is what a client-side
+`list.reverse()` after a forward scan would have given. A reverse
+`sdb_kv_scan_prefix` derives the prefix's exclusive byte-successor as the
+range's upper edge; a prefix of all `0xFF` bytes has no successor, and since
+nothing sorts above it the walk correctly starts at the namespace's end. The
+prefix itself is capped at `SDB_ENGINE_MAX_NAME_SIZE`.
+
 ## On-disk format and migration
 
 The current on-disk format is V2. Its object/chunk key layout stores the user
@@ -149,7 +166,8 @@ on-disk format and never touch the pager/WAL/B+Tree directly:
   reading each body, skipping any deleted in between.
 
 The native `shibadb` CLI surfaces several of these directly: `exists`, `count`
-(with `--prefix`), and `incr`.
+(with `--prefix`), and `incr`. Its `scan` accepts `--prefix`, `--limit`, and
+`--reverse`, which map onto `sdb_scan_options` unchanged.
 
 ## Current limitations
 
