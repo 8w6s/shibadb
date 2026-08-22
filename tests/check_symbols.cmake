@@ -64,12 +64,17 @@ set(SDB_TOOLCHAIN_SYMBOL_PATTERNS
     "^__prof[cdnv]"     # LLVM raw profile counters/data/names
     "^__gcov"           # GCC gcov runtime
     "^_?_gcno"          # GCC coverage notes
-    "^__asan_"          # AddressSanitizer
+    "^__asan_"          # AddressSanitizer entry points
     "^__ubsan_"         # UndefinedBehaviorSanitizer
     "^__msan_"          # MemorySanitizer
     "^__tsan_"          # ThreadSanitizer
     "^__lsan_"          # LeakSanitizer
     "^__sanitizer_"     # common sanitizer interface
+    # Section-bracketing symbols the sanitizers emit around their instrumented
+    # globals/counters metadata. These are NOT __-prefixed -- ASan emits
+    # _start_asan_globals / _stop_asan_globals -- so the prefixes above miss
+    # them and the sanitize preset failed on exactly this.
+    "^_(start|stop)_[a-z]+_(globals|counters|array|sections)$"
 )
 
 execute_process(
