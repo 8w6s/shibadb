@@ -1,5 +1,6 @@
 #include "cpu_features.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,10 +90,27 @@ static void sdb_cpu_detect(void)
     {
         /* Escape hatch: force the scalar path regardless of hardware. Lets the
          * differential tests exercise both backends on one machine and gives
-         * operators a runtime kill switch if a SIMD kernel ever misbehaves. */
+         * operators a runtime kill switch if a SIMD kernel ever misbehaves.
+         *
+         * The MSVC CRT deprecates getenv in favour of _dupenv_s, which returns
+         * an owned copy. Suppressing the deprecation would mean defining
+         * _CRT_SECURE_NO_WARNINGS across the whole library, so the Windows path
+         * uses the CRT's own spelling instead and frees what it is handed. */
+        bool disabled = false;
+#if defined(_MSC_VER) || (defined(_WIN32) && defined(__clang__))
+        char *disable = NULL;
+        size_t disable_size = 0;
+        if (_dupenv_s(&disable, &disable_size, "SDB_NO_SIMD") == 0
+            && disable != NULL) {
+            disabled = disable[0] != '\0' && strcmp(disable, "0") != 0;
+            free(disable);
+        }
+#else
         const char *disable = getenv("SDB_NO_SIMD");
-        if (disable != NULL && disable[0] != '\0'
-            && strcmp(disable, "0") != 0) {
+        disabled = disable != NULL && disable[0] != '\0'
+            && strcmp(disable, "0") != 0;
+#endif
+        if (disabled) {
             (void)memset(&features, 0, sizeof(features));
         }
     }
