@@ -68,6 +68,33 @@ if(NOT WIN32)
     find_package(Threads REQUIRED)
 endif()
 
+# Warning flags, factored out so test targets get the same treatment as the
+# library. The previous arrangement listed every test by hand and had drifted:
+# 14 of 64 executables were missing /W4 /WX, including test_wal_format,
+# test_wal_index and test_wal_recover_forge. A hand-maintained list cannot help
+# but rot as tests are added, so the flags are applied by function now.
+function(shibadb_strict_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+        # clang-cl sets MSVC, but /W4 there does not imply -Wconversion or
+        # -Wshadow the way the GNU-style branch does. Measured on clang 22: a
+        # size_t->int narrowing plus a shadowed local produce 2 findings under
+        # /W4 /WX and 4 under the GNU flags. Add the missing ones so a Windows
+        # clang build is held to the same bar as CI on Linux.
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+            target_compile_options(${target} PRIVATE
+                -Wconversion -Wshadow
+                -Wstrict-prototypes -Wmissing-prototypes
+            )
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+            -Wstrict-prototypes -Wmissing-prototypes -Werror
+        )
+    endif()
+endfunction()
+
 function(shibadb_configure_target target)
     target_include_directories(${target}
         PUBLIC
@@ -100,14 +127,7 @@ function(shibadb_configure_target target)
         C_EXTENSIONS OFF
         POSITION_INDEPENDENT_CODE ON
     )
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /WX)
-    else()
-        target_compile_options(${target} PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-            -Wstrict-prototypes -Wmissing-prototypes -Werror
-        )
-    endif()
+    shibadb_strict_warnings(${target})
     if(SDB_ENABLE_SANITIZERS AND NOT MSVC)
         target_compile_options(${target} PUBLIC
             -fno-omit-frame-pointer -fsanitize=address,undefined
@@ -310,17 +330,15 @@ if(SDB_BUILD_CLI)
         ARCHIVE_OUTPUT_NAME shibadb_cli
     )
     target_link_libraries(shibadb_cli PRIVATE ShibaDB::core)
-    if(MSVC)
-        target_compile_options(shibadb_cli PRIVATE /W4 /WX)
-        # The CLI reads getenv("SHIBADB_PASSWORD"); MSVC deprecates getenv
-        # (C4996) but the call is portable and correct. Scope the suppression
-        # to this target only — the library core stays free of it.
+    shibadb_strict_warnings(shibadb_cli)
+    if(WIN32)
+        # The CLI reads getenv("SHIBADB_PASSWORD"); the MSVC CRT deprecates
+        # getenv (C4996) in favour of _dupenv_s, which is not portable, so the
+        # call stays and the warning is silenced for this target only -- the
+        # library core keeps it. Keyed on WIN32 rather than MSVC because a plain
+        # clang targeting windows-msvc uses the same CRT headers and reports the
+        # same deprecation without CMake setting MSVC.
         target_compile_definitions(shibadb_cli PRIVATE _CRT_SECURE_NO_WARNINGS)
-    else()
-        target_compile_options(shibadb_cli PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-            -Wstrict-prototypes -Wmissing-prototypes -Werror
-        )
     endif()
     install(TARGETS shibadb_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -555,210 +573,31 @@ if(SDB_BUILD_TESTS)
         test_txn_begin_commit_race tests/test_txn_begin_commit_race.c
     )
     target_link_libraries(test_txn_begin_commit_race PRIVATE ShibaDB::core)
-    if(MSVC)
-        target_compile_options(test_abi PRIVATE /W4 /WX)
-        target_compile_options(test_superblock PRIVATE /W4 /WX)
-        target_compile_options(test_database_info PRIVATE /W4 /WX)
-        target_compile_options(test_convenience PRIVATE /W4 /WX)
-        target_compile_options(crash_writer PRIVATE /W4 /WX)
-        target_compile_options(test_codec PRIVATE /W4 /WX)
-        target_compile_options(test_file PRIVATE /W4 /WX)
-        target_compile_options(test_utf8_path PRIVATE /W4 /WX)
-        target_compile_options(test_superblock_store PRIVATE /W4 /WX)
-        target_compile_options(test_page PRIVATE /W4 /WX)
-        target_compile_options(test_pager PRIVATE /W4 /WX)
-        target_compile_options(test_page_cache PRIVATE /W4 /WX)
-        target_compile_options(test_pager_fault PRIVATE /W4 /WX)
-        target_compile_options(test_transaction PRIVATE /W4 /WX)
-        target_compile_options(test_transaction_crash PRIVATE /W4 /WX)
-        target_compile_options(test_btree_page PRIVATE /W4 /WX)
-        target_compile_options(test_btree PRIVATE /W4 /WX)
-        target_compile_options(test_btree_property PRIVATE /W4 /WX)
-        target_compile_options(test_btree_batch PRIVATE /W4 /WX)
-        target_compile_options(test_btree_reclaim PRIVATE /W4 /WX)
-        target_compile_options(test_btree_reclaim_overflow PRIVATE /W4 /WX)
-        target_compile_options(test_txn_cancel_alloc PRIVATE /W4 /WX)
-        target_compile_options(test_crypto PRIVATE /W4 /WX)
-        target_compile_options(test_sha256_simd PRIVATE /W4 /WX)
-        target_compile_options(test_crc32_simd PRIVATE /W4 /WX)
-        target_compile_options(test_chacha_simd PRIVATE /W4 /WX)
-        target_compile_options(test_cache_auto PRIVATE /W4 /WX)
-        target_compile_options(test_encryption PRIVATE /W4 /WX)
-        target_compile_options(test_encryption_fault PRIVATE /W4 /WX)
-        target_compile_options(test_engine PRIVATE /W4 /WX)
-        target_compile_options(test_engine_property PRIVATE /W4 /WX)
-        target_compile_options(test_engine_fault PRIVATE /W4 /WX)
-        target_compile_options(test_engine_concurrency PRIVATE /W4 /WX)
-        target_compile_options(test_engine_operations PRIVATE /W4 /WX)
-        target_compile_options(test_public_transaction PRIVATE /W4 /WX)
-        target_compile_options(
-            test_public_transaction_property PRIVATE /W4 /WX
-        )
-        target_compile_options(
-            test_public_transaction_concurrency PRIVATE /W4 /WX
-        )
-        target_compile_options(test_public_transaction_fault PRIVATE /W4 /WX)
-        target_compile_options(test_group_commit PRIVATE /W4 /WX)
-        target_compile_options(test_mixed_workload PRIVATE /W4 /WX)
-        target_compile_options(test_compact_encryption PRIVATE /W4 /WX)
-        target_compile_options(test_crash_injection PRIVATE /W4 /WX)
-        target_compile_options(test_churn_reclaim PRIVATE /W4 /WX)
-        target_compile_options(test_index_churn_reclaim PRIVATE /W4 /WX)
-        target_compile_options(test_legacy_index_reclaim PRIVATE /W4 /WX)
-        target_compile_options(test_group_commit_batch PRIVATE /W4 /WX)
-        target_compile_options(test_txn_begin_commit_race PRIVATE /W4 /WX)
-        if(UNIX)
-            target_compile_options(
-                test_public_transaction_crash PRIVATE /W4 /WX
-            )
+    # Every test executable gets the same warning bar as the library. This was
+    # a hand-written list of per-target target_compile_options calls and it had
+    # drifted: 14 of 64 executables carried no /W4 /WX at all, test_wal_format,
+    # test_wal_index and test_wal_recover_forge among them. Iterating over the
+    # targets keeps a newly added test from silently opting out.
+    get_property(sdb_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(sdb_target IN LISTS sdb_all_targets)
+        get_target_property(sdb_target_type ${sdb_target} TYPE)
+        if(sdb_target_type STREQUAL "EXECUTABLE")
+            shibadb_strict_warnings(${sdb_target})
         endif()
-    else()
-        target_compile_options(test_abi PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_superblock PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_database_info PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_convenience PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(crash_writer PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_codec PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_file PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_utf8_path PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_superblock_store PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_page PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_pager PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_page_cache PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_pager_fault PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_transaction PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_transaction_crash PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_btree_page PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_btree PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_btree_property PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_btree_batch PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_btree_reclaim PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_btree_reclaim_overflow PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_txn_cancel_alloc PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_crypto PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_sha256_simd PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_crc32_simd PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_chacha_simd PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_cache_auto PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_encryption PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_encryption_fault PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_engine PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_engine_property PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_engine_fault PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_engine_concurrency PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_engine_operations PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_public_transaction PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_public_transaction_property PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_public_transaction_concurrency PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_public_transaction_fault PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_group_commit PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_mixed_workload PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_compact_encryption PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_crash_injection PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_churn_reclaim PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_index_churn_reclaim PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_legacy_index_reclaim PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_group_commit_batch PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        target_compile_options(test_txn_begin_commit_race PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-        )
-        if(UNIX)
-            target_compile_options(test_public_transaction_crash PRIVATE
-                -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror
-            )
-        endif()
+    endforeach()
+    if(WIN32)
+        # These two open raw WAL/database files with fopen to corrupt them by
+        # hand. The MSVC CRT deprecates fopen in favour of fopen_s, which is not
+        # portable, so the call stays and the warning is silenced per target --
+        # the same treatment shibadb_cli gets for getenv. Scoped here rather
+        # than globally so the library core keeps the deprecation warning.
+        foreach(sdb_raw_io_target test_replace_recover test_wal_recover_error)
+            if(TARGET ${sdb_raw_io_target})
+                target_compile_definitions(
+                    ${sdb_raw_io_target} PRIVATE _CRT_SECURE_NO_WARNINGS
+                )
+            endif()
+        endforeach()
     endif()
     add_test(NAME abi COMMAND test_abi)
     add_test(NAME superblock COMMAND test_superblock)
