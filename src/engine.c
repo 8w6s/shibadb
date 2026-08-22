@@ -5903,9 +5903,7 @@ sdb_status sdb_index_visit(
 }
 
 /*
- * ============================================================================
  * Read snapshots, forward cursors, prefix scan (read-only iteration).
- * ============================================================================
  */
 
 void sdb_cursor_options_init(sdb_cursor_options *options)
@@ -6763,4 +6761,3 @@ sdb_status sdb_list_namespaces(
 }
 
 #undef SDB_ENGINE_LOCK_OR_RETURN
-

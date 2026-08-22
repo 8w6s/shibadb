@@ -497,13 +497,11 @@ SDB_API sdb_status sdb_index_visit(
 );
 
 /*
- * ============================================================================
  * Scan / cursor / enumerate (append-only, SDB_ENGINE_API_VERSION 1).
  * See docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md. This first slice ships
  * forward-only KV cursors, prefix scan sugar, and read snapshots. Reverse
  * iteration and blob/collection enumeration are added by later slices; the
  * declarations here are stable and additive.
- * ============================================================================
  */
 
 /*
@@ -731,13 +729,11 @@ SDB_API sdb_status sdb_list_namespaces(
 );
 
 /*
- * ============================================================================
  * Convenience API (SDB_ENGINE_API_VERSION 2). Additive, ergonomic wrappers
  * over the primitives above: allocating reads, existence and count, atomic
  * put-if-absent / compare-and-swap / increment, one-call atomic batches. None
  * of these change the on-disk format or touch the audited pager/WAL/B+Tree —
  * they compose the public KV, scan, and transaction entry points.
- * ============================================================================
  */
 
 /**

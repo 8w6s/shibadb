@@ -6,11 +6,9 @@
 #include <string.h>
 
 /*
- * ============================================================================
  * Convenience API (SDB_ENGINE_API_VERSION 2) — see shibadb_engine.h. Thin
  * wrappers that compose the public KV, scan, and transaction entry points;
  * they add no on-disk state and never touch the pager/WAL/B+Tree directly.
- * ============================================================================
  */
 
 void sdb_free(void *pointer)
