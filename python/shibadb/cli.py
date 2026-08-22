@@ -8,7 +8,8 @@ Commands:
     put <ns> <key> <value>         store a KV value
     get <ns> <key>                 print a KV value
     del <ns> <key>                 delete a KV value
-    scan <ns> [--prefix P]         print key=value for a namespace
+    scan <ns> [--prefix P] [--reverse] [--limit N]
+                                   print key=value for a namespace
     find <ns> <query-json>         print matches of a Mongo-style query
     namespaces                     list "kind<TAB>namespace" for populated ones
     stats                          print verify() counters
@@ -75,9 +76,15 @@ def _cmd_del(args) -> int:
 
 def _cmd_scan(args) -> int:
     prefix = args.prefix.encode("utf-8") if args.prefix else b""
+    if args.limit < 0:
+        print("error: --limit must be >= 0", file=sys.stderr)
+        return 2
     with _open(args) as db:
-        for key, value in db.scan(args.namespace, prefix):
-            print(f"{_show(key)}={_show(value)}")
+        rows = db.scan(
+            args.namespace, prefix, reverse=args.reverse, limit=args.limit
+        )
+    for key, value in rows:
+        print(f"{_show(key)}={_show(value)}")
     return 0
 
 
@@ -150,6 +157,13 @@ def _build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan")
     scan.add_argument("namespace")
     scan.add_argument("--prefix", default=None)
+    scan.add_argument(
+        "--reverse", action="store_true", help="descending key order"
+    )
+    scan.add_argument(
+        "--limit", type=int, default=0,
+        help="max entries (0 = all); with --reverse, the greatest n keys",
+    )
     scan.set_defaults(func=_cmd_scan)
 
     find = sub.add_parser("find")

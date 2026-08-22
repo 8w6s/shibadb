@@ -43,6 +43,18 @@ function(expect_contains haystack needle label)
     endif()
 endfunction()
 
+# expect_exact(<actual> <expected> <label>): compare whole stdout, ignoring the
+# CR the Windows CRT adds to every '\n' written in text mode. Used where the
+# ORDER of lines is the property under test and `expect_contains` would pass
+# regardless of it.
+function(expect_exact actual expected label)
+    string(REPLACE "\r" "" _actual "${actual}")
+    if(NOT _actual STREQUAL expected)
+        message(FATAL_ERROR
+            "${label}: expected\n'${expected}'\ngot\n'${_actual}'")
+    endif()
+endfunction()
+
 # version
 run(0 out version)
 expect_contains("${out}" "shibadb " "version banner")
@@ -73,6 +85,23 @@ expect_contains("${out}" "carol\tv-carol" "scan carol")
 # prefix scan
 run(0 out scan "${DB}" users --prefix b)
 expect_contains("${out}" "bob\tv-bob" "prefix scan")
+
+# reverse scan: descending key order (carol, bob, alice)
+run(0 out scan "${DB}" users --reverse)
+expect_exact("${out}"
+    "carol\tv-carol\nbob\tv-bob\nalice\t{role:admin}\n" "reverse scan order")
+
+# reverse + limit takes the GREATEST n keys, not the first n flipped
+run(0 out scan "${DB}" users --reverse --limit 2)
+expect_exact("${out}" "carol\tv-carol\nbob\tv-bob\n" "reverse --limit 2")
+
+# forward --limit 2 for contrast: the smallest two keys
+run(0 out scan "${DB}" users --limit 2)
+expect_exact("${out}" "alice\t{role:admin}\nbob\tv-bob\n" "forward --limit 2")
+
+# --reverse composes with --prefix
+run(0 out scan "${DB}" users --prefix c --reverse)
+expect_exact("${out}" "carol\tv-carol\n" "reverse prefix scan")
 
 # namespaces
 run(0 out namespaces "${DB}")

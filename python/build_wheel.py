@@ -18,7 +18,7 @@ import zipfile
 
 NAME = "shibadb"
 
-VERSION = "0.1.0"
+VERSION = "1.0.0"
 
 def digest(data: bytes) -> str:
 

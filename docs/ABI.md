@@ -33,8 +33,21 @@ WAL, crypto, allocator, synchronization, and fault-injection symbols are not
 exported.
 
 The ABI test freezes public structure layouts and runtime version functions.
-The symbol test compares the actual dynamic symbol table byte-for-byte with
-the allowlist.
+The `abi_symbols` test compares the shared library's actual exported symbol
+table with the allowlist, in both directions: an entry exported but not listed
+is a leaked internal symbol, and an entry listed but not exported is one that
+lost its `SDB_API`. Symbols injected by a coverage or sanitizer runtime
+(`__llvm_*`, `__gcov*`, `__asan_*`, and the like) are filtered out by prefix, so
+instrumented presets are checked as strictly as a plain build. The test reports
+only the differing symbols, not two full lists.
+
+The extractor follows the library's object format rather than the host: ELF
+dynamic tables and Mach-O (whose leading underscore is stripped) are read with
+`nm`, and PE export directories with `objdump -p`, since a DLL carries no
+dynamic symbol table for `nm -D` to read. The gate is therefore registered on
+Linux, macOS, and MinGW builds; only MSVC is skipped, because the toolchain
+ships neither tool. A read that yields no symbols at all fails the test rather
+than passing vacuously against the allowlist.
 
 ## CMake installation
 

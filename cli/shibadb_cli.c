@@ -35,6 +35,7 @@ typedef struct cli_options {
     const char *prefix;     /* scan prefix, NULL = whole namespace */
     uint64_t limit;         /* 0 = unlimited */
     uint64_t synchronous;   /* SDB_SYNCHRONOUS_FULL (0) or _NORMAL (1) */
+    bool reverse;           /* scan: descending key order */
     bool force;             /* backup: replace existing destination */
     bool unique;            /* mkindex: create a unique index */
     const char *index_specs[16]; /* docput: repeated --index name=value */
@@ -48,6 +49,7 @@ static void cli_options_init(cli_options *opts) {
     opts->prefix = NULL;
     opts->limit = 0U;
     opts->synchronous = 0U;
+    opts->reverse = false;
     opts->force = false;
     opts->unique = false;
     opts->index_count = 0U;
@@ -109,6 +111,8 @@ static int cli_parse_options(int argc, char **argv, cli_options *opts,
                         "shibadb: --synchronous must be 'full' or 'normal'\n");
                 return -1;
             }
+        } else if (strcmp(arg, "--reverse") == 0) {
+            opts->reverse = true;
         } else if (strcmp(arg, "--force") == 0 || strcmp(arg, "-f") == 0) {
             opts->force = true;
         } else if (strcmp(arg, "--unique") == 0) {
@@ -349,6 +353,7 @@ static int cmd_scan(const char *path, const char *ns, const cli_options *opts) {
     sdb_scan_options scan_opts;
     sdb_scan_options_init(&scan_opts);
     scan_opts.limit = opts->limit;
+    scan_opts.reverse = opts->reverse;
 
     const uint8_t *prefix = NULL;
     size_t prefix_size = 0;
@@ -778,7 +783,7 @@ static int usage(FILE *out) {
 "  put        <file> <ns> <k> <v>  Store a KV pair\n"
 "  get        <file> <ns> <k>      Fetch a value (raw bytes to stdout)\n"
 "  del        <file> <ns> <k>      Delete a key\n"
-"  scan       <file> <ns>          Print key<TAB>value lines\n"
+"  scan       <file> <ns>          Print key<TAB>value lines (--reverse)\n"
 "  namespaces <file>               List populated (kind, namespace) pairs\n"
 "  verify     <file>               Deep structural verification\n"
 "  health     <file>               Open the engine and print a config snapshot\n"
@@ -801,6 +806,8 @@ static int usage(FILE *out) {
 "      --kdf-iterations <n>  PBKDF2 iterations for create\n"
 "      --prefix <p>      Restrict scan to keys with this prefix\n"
 "      --limit <n>       Max entries for scan (0 = all)\n"
+"      --reverse         scan: descending key order (with --limit, the\n"
+"                        greatest n keys)\n"
 "      --synchronous <m> Durability of auto-commits: full (default) or\n"
 "                        normal (faster; may lose the newest commits on\n"
 "                        power loss, never corrupts)\n"

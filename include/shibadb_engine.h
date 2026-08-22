@@ -498,10 +498,10 @@ SDB_API sdb_status sdb_index_visit(
 
 /*
  * Scan / cursor / enumerate (append-only, SDB_ENGINE_API_VERSION 1).
- * See docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md. This first slice ships
- * forward-only KV cursors, prefix scan sugar, and read snapshots. Reverse
- * iteration and blob/collection enumeration are added by later slices; the
- * declarations here are stable and additive.
+ * See docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md. This slice ships KV cursors in
+ * both directions, prefix scan sugar (forward and reverse), and read snapshots.
+ * Blob/collection enumeration and transactional scans are added by later
+ * slices; the declarations here are stable and additive.
  */
 
 /*
@@ -537,8 +537,12 @@ typedef struct sdb_cursor sdb_cursor;
  * lower_bound / upper_bound define an optional half-open range [lower, upper);
  * both are COPIED into cursor storage at open time (callers may free/reuse the
  * buffers immediately). limit: if non-zero, the cursor becomes invalid after
- * `limit` successful positioning steps. `reverse` is reserved for a later
- * slice and MUST be false for now (non-false is rejected).
+ * `limit` successful positioning steps. reverse: iterate in descending
+ * byte-lexicographic order — sdb_cursor_first positions at the range's LAST
+ * entry and sdb_cursor_next steps toward its first; the range stays the same
+ * half-open [lower, upper), so the greatest entry visited is the last one
+ * strictly below upper_bound and the walk stops once it falls below
+ * lower_bound.
  */
 typedef struct sdb_cursor_options {
     uint32_t struct_size;
@@ -554,7 +558,11 @@ typedef struct sdb_cursor_options {
 
 SDB_API void sdb_cursor_options_init(sdb_cursor_options *options);
 
-/* Scan sugar options. `reverse` reserved (must be false for now). */
+/*
+ * Scan sugar options. reverse: visit matches in descending key order. limit: at
+ * most this many visitor invocations (0 = unlimited) — combined with reverse it
+ * yields the GREATEST `limit` matches, not the smallest ones flipped.
+ */
 typedef struct sdb_scan_options {
     uint32_t struct_size;
     bool reverse;
@@ -598,10 +606,11 @@ SDB_API sdb_status sdb_snapshot_close(sdb_snapshot *snapshot);
 SDB_API uint64_t sdb_snapshot_version(const sdb_snapshot *snapshot);
 
 /*
- * Open a forward cursor over keyspace_kind + namespace within snapshot. After
- * open the cursor is UNPOSITIONED: sdb_cursor_valid is false and sdb_cursor_next
- * returns SDB_E_INVALID_ARGUMENT until sdb_cursor_first or sdb_cursor_seek is
- * called. options may be NULL (defaults).
+ * Open a cursor over keyspace_kind + namespace within snapshot, iterating in the
+ * direction given by options->reverse (ascending by default). After open the
+ * cursor is UNPOSITIONED: sdb_cursor_valid is false and sdb_cursor_next returns
+ * SDB_E_INVALID_ARGUMENT until sdb_cursor_first or sdb_cursor_seek is called.
+ * options may be NULL (defaults).
  */
 SDB_API sdb_status sdb_cursor_open(
     sdb_snapshot *snapshot,
@@ -613,8 +622,9 @@ SDB_API sdb_status sdb_cursor_open(
 );
 
 /*
- * Position at the first in-range entry (SDB_OK; sdb_cursor_valid false if the
- * range is empty).
+ * Position at the first in-range entry in the cursor's direction — the least for
+ * a forward cursor, the greatest for a reverse one (SDB_OK; sdb_cursor_valid
+ * false if the range is empty). Resets the limit counter.
  */
 SDB_API sdb_status sdb_cursor_first(sdb_cursor *cursor);
 
@@ -629,9 +639,10 @@ SDB_API sdb_status sdb_cursor_seek(
 );
 
 /*
- * Advance to the next entry. On a positioned cursor at the last entry, leaves
- * the cursor invalid and returns SDB_OK. On an unpositioned cursor returns
- * SDB_E_INVALID_ARGUMENT.
+ * Advance one entry in the cursor's direction (ascending forward, descending in
+ * reverse). At the end of the range, leaves the cursor invalid and returns
+ * SDB_OK — end-of-iteration is never SDB_E_NOT_FOUND. On an unpositioned cursor
+ * returns SDB_E_INVALID_ARGUMENT.
  */
 SDB_API sdb_status sdb_cursor_next(sdb_cursor *cursor);
 
@@ -686,9 +697,11 @@ SDB_API sdb_status sdb_cursor_close(sdb_cursor *cursor);
 /*
  * Auto-commit prefix scan over one KV namespace. Opens an ephemeral snapshot
  * (takes the active-session slot for the whole walk -> writer-blocking under
- * the single-mutex model), invokes visitor for every key beginning with prefix
- * in ascending order. prefix may be NULL iff prefix_size == 0 (whole namespace).
- * options may be NULL. match_count_out is optional.
+ * the single-mutex model), invokes visitor for every key beginning with prefix,
+ * ascending — or descending when options->reverse is set. prefix may be NULL iff
+ * prefix_size == 0 (whole namespace) and is capped at SDB_ENGINE_MAX_NAME_SIZE.
+ * options may be NULL (forward, unlimited). match_count_out is optional and
+ * receives the visitor-invocation count, written only on success.
  */
 SDB_API sdb_status sdb_kv_scan_prefix(
     sdb_database *database,

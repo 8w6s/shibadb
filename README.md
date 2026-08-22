@@ -113,6 +113,7 @@ shibadb create  data.shiba
 shibadb put     data.shiba users alice '{"role":"admin"}'
 shibadb get     data.shiba users alice
 shibadb scan    data.shiba users --prefix a
+shibadb scan    data.shiba users --reverse --limit 10   # newest 10 by key
 shibadb incr    data.shiba counters visits
 shibadb mkindex data.shiba people by_role
 shibadb docput  data.shiba people u1 '{"name":"alice"}' --index by_role=admin

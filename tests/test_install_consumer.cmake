@@ -52,10 +52,20 @@ if(WIN32)
     set(shared_executable "${consumer_bindir}/consumer_shared.exe")
     set(static_executable "${consumer_bindir}/consumer_static.exe")
     set(cpp_executable "${consumer_bindir}/consumer_cpp.exe")
-    # The shared consumer links shibadb.dll, installed to <prefix>/bin. Windows
-    # has no rpath; the loader searches the executable's own directory first, so
-    # stage the DLL beside the consumer rather than mutating PATH.
-    file(COPY "${INSTALL_PREFIX}/bin/shibadb.dll" DESTINATION "${consumer_bindir}")
+    # The DLL's on-disk name is toolchain-dependent: MSVC emits shibadb.dll
+    # while MinGW prefixes it to libshibadb.dll. Take the real name from the
+    # target rather than hard-coding either, and fail loudly if it is absent --
+    # a silent miss here used to surface as an unrelated "file COPY cannot find"
+    # error from CMake.
+    if(NOT DEFINED RUNTIME_NAME OR RUNTIME_NAME STREQUAL "")
+        message(FATAL_ERROR "RUNTIME_NAME is required on Windows")
+    endif()
+    set(installed_dll "${INSTALL_PREFIX}/bin/${RUNTIME_NAME}")
+    if(NOT EXISTS "${installed_dll}")
+        message(FATAL_ERROR
+            "install did not place ${RUNTIME_NAME} in ${INSTALL_PREFIX}/bin")
+    endif()
+    file(COPY "${installed_dll}" DESTINATION "${consumer_bindir}")
 else()
     set(shared_executable "${consumer_build}/consumer_shared")
     set(static_executable "${consumer_build}/consumer_static")
