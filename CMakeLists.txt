@@ -706,6 +706,56 @@ if(SDB_BUILD_TESTS)
         RUN_SERIAL TRUE
     )
 
+    # The Python layer was deleted in 522c876 and restored in c7a9aa8, but the
+    # restore never brought back the ctest registrations — so python/ shipped
+    # with nothing running its tests, and a wheel that omitted every module but
+    # __init__.py went unnoticed. Wire the suites that exist back up.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_FOUND)
+        set(SDB_PYTHON_ENV
+            "SHIBADB_LIBRARY=$<TARGET_FILE:shibadb_shared>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # cli.py / legacy_fixture.py drive main() directly rather than exposing
+        # test_* functions, so they run as plain scripts, not under pytest.
+        foreach(script cli legacy_fixture)
+            add_test(
+                NAME python_${script}
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${script}.py
+            )
+            set_tests_properties(python_${script} PROPERTIES
+                ENVIRONMENT "${SDB_PYTHON_ENV}"
+            )
+        endforeach()
+        # The rest are pytest modules. One invocation keeps collection cost down.
+        add_test(
+            NAME python_pytest
+            COMMAND ${Python3_EXECUTABLE} -m pytest -q
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_polyglot.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_command.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scan_query.py
+        )
+        set_tests_properties(python_pytest PROPERTIES
+            ENVIRONMENT "${SDB_PYTHON_ENV}"
+        )
+        # Build the wheel, install it into a throwaway venv, and drive the CLI
+        # suite through the installed package. This is what catches a wheel that
+        # builds and imports but is missing a module the lazy imports need.
+        add_test(
+            NAME python_wheel
+            COMMAND ${CMAKE_COMMAND}
+                -DPYTHON=${Python3_EXECUTABLE}
+                -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                -DLIBRARY=$<TARGET_FILE:shibadb_shared>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_wheel.cmake
+        )
+        set_tests_properties(python_wheel PROPERTIES
+            LABELS packaging
+            RUN_SERIAL TRUE
+        )
+    endif()
+
     # Drive the native CLI end to end (argument parsing, exit codes, KV round
     # trip, encryption, backup/compact) the way a shell script would.
     if(SDB_BUILD_CLI)

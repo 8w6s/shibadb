@@ -96,6 +96,25 @@ def _cmd_find(args) -> int:
     return 0
 
 
+def _cmd_query(args) -> int:
+    with _open(args) as db:
+        try:
+            result = db.query(args.statement)
+        except (ValueError, NotImplementedError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+    # SELECT hands back rows; INSERT a key; UPDATE/DELETE a count. Print rows
+    # one JSON object per line so the output pipes into jq like find does.
+    if isinstance(result, list):
+        for document in result:
+            print(json.dumps(document))
+    elif isinstance(result, (bytes, bytearray)):
+        print(_show(bytes(result)))
+    else:
+        print(result)
+    return 0
+
+
 _KIND_NAMES = {1: "kv", 2: "blob", 3: "document"}
 
 
@@ -156,6 +175,10 @@ def _build_parser() -> argparse.ArgumentParser:
     find.add_argument("namespace")
     find.add_argument("query", help="Mongo-style query as a JSON object")
     find.set_defaults(func=_cmd_find)
+
+    query = sub.add_parser("query")
+    query.add_argument("statement", help="SQL or Mongo-style statement")
+    query.set_defaults(func=_cmd_query)
 
     sub.add_parser("namespaces").set_defaults(func=_cmd_namespaces)
 

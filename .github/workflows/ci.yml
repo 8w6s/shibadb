@@ -120,12 +120,19 @@ jobs:
             platform: Windows
     steps:
       - uses: actions/checkout@v4
-      # The native ctest suite is pure C now (the Python binding was removed),
-      # so no Python is needed here. Windows uses the Ninja generator, which
-      # needs the MSVC toolchain on PATH — set it up via the dev-cmd action.
+      # The binding came back in c7a9aa8, so the suite is no longer pure C: the
+      # python_* tests need an interpreter with pytest, and CMake skips
+      # registering them when Python3 is absent — which is how they went
+      # unnoticed. Windows uses the Ninja generator, which needs the MSVC
+      # toolchain on PATH: set it up via the dev-cmd action.
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build

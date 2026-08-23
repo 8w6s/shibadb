@@ -37,10 +37,17 @@ execute_process(
 if(NOT status EQUAL 0)
     message(FATAL_ERROR "Wheel installation failed")
 endif()
+# test_python_binding.py went away with the Python layer in 522c876 and the
+# restore never brought it back, so this drove a missing file. Run the installed
+# CLI suite instead: it imports shibadb.cli, which reaches .query and .polyglot,
+# so a wheel that omits a module fails here rather than in a user's venv.
+# PYTHONPATH is deliberately unset — the point is to exercise the INSTALLED
+# package, so an in-tree fallback would defeat the test.
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
         "SHIBADB_LIBRARY=${LIBRARY}"
-        "${venv_python}" "${SOURCE_DIR}/tests/test_python_binding.py"
+        --unset=PYTHONPATH
+        "${venv_python}" "${SOURCE_DIR}/tests/test_cli.py"
     WORKING_DIRECTORY "${BUILD_DIR}"
     RESULT_VARIABLE status
 )
