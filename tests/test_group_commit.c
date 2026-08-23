@@ -16,10 +16,27 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
 #endif
 
 #define THREAD_COUNT 16U
 #define RECORDS_PER_THREAD 96U
+
+/*
+ * One-way "worker has started" flag, set once by a worker and polled by the
+ * main thread. Not <stdatomic.h>: the MSVC CRT gates C11 atomics behind
+ * /experimental:c11atomics on the toolchains this suite still has to build on,
+ * so route through Interlocked there and the GCC/Clang builtins elsewhere —
+ * the latter is also what keeps ThreadSanitizer from flagging the handshake as
+ * a data race.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define STARTED_STORE(flag_) (void)InterlockedExchange(&(flag_), 1L)
+#define STARTED_LOAD(flag_) (InterlockedCompareExchange(&(flag_), 0L, 0L) != 0L)
+#else
+#define STARTED_STORE(flag_) __atomic_store_n(&(flag_), 1L, __ATOMIC_RELEASE)
+#define STARTED_LOAD(flag_) (__atomic_load_n(&(flag_), __ATOMIC_ACQUIRE) != 0L)
+#endif
 
 static const char *database_path = "test-group-commit.tmp";
 static const char *wal_path = "test-group-commit.tmp.wal";
@@ -45,7 +62,28 @@ typedef struct worker_context {
     bool failed;
     int fail_status;
     uint32_t fail_record;
+    /*
+     * Set by the worker once its first commit has returned, polled by the main
+     * thread through STARTED_LOAD/STARTED_STORE. long because that is what the
+     * Interlocked* family takes; the fields above are private to one thread and
+     * need no ordering.
+     */
+    long started;
 } worker_context;
+
+/*
+ * Yield the CPU for roughly a millisecond. Used only to spin-wait for the
+ * workers to enter their commit loop — never inside a measured window.
+ */
+static void short_sleep(void)
+{
+#ifdef _WIN32
+    Sleep(1U);
+#else
+    const struct timespec delay = {0, 1000000L};
+    (void)nanosleep(&delay, NULL);
+#endif
+}
 
 /*
  * Each thread commits RECORDS_PER_THREAD independent keys via the auto-commit
@@ -71,6 +109,15 @@ static void run_worker(worker_context *context)
             value,
             sizeof(value)
         );
+        if (record == 0U) {
+            /*
+             * Only the first iteration publishes; the flag is a one-way
+             * "this thread is live" signal, and storing it on all 96 rounds
+             * would put 16 threads in a write loop over adjacent context
+             * structs — false sharing that skews the very race being measured.
+             */
+            STARTED_STORE(context->started);
+        }
         if (put_status != SDB_OK) {
             context->failed = true;
             context->fail_status = (int)put_status;
@@ -152,6 +199,7 @@ static void test_compact_races_commit(void)
         contexts[index].failed = false;
         contexts[index].fail_status = 0;
         contexts[index].fail_record = 0U;
+        contexts[index].started = 0L;
 #ifdef _WIN32
         threads[index] = CreateThread(
             NULL, 0U, worker_entry, &contexts[index], 0U, NULL
@@ -162,6 +210,21 @@ static void test_compact_races_commit(void)
             &threads[index], NULL, worker_entry, &contexts[index]
         ) == 0);
 #endif
+    }
+    /*
+     * Wait until every worker has landed a commit before compacting. Thread
+     * creation is not thread START: on Windows the 16 threads can still be
+     * spawning while this thread runs all COMPACT_ROUNDS against a database
+     * that is effectively idle, which drains the loop in well under a second,
+     * makes every round return OK, and leaves compact_busy at 0 — the
+     * assertion below then fails for a scheduling reason, not a defect.
+     * Handshaking first makes the race window an actual precondition of the
+     * loop instead of a bet on relative thread speed.
+     */
+    for (index = 0U; index < THREAD_COUNT; ++index) {
+        while (!STARTED_LOAD(contexts[index].started)) {
+            short_sleep();
+        }
     }
     for (round = 0U; round < COMPACT_ROUNDS; ++round) {
         sdb_compact_result result;
