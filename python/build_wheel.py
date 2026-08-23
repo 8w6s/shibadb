@@ -38,11 +38,19 @@ def main() -> int:
 
     dist_info = f"{NAME}-{VERSION}.dist-info"
 
+    package = root / "python" / NAME
+
+    # Every .py in the package, not just __init__.py. __init__ imports .query
+    # and .polyglot lazily inside find_query()/query(), so a wheel carrying
+    # only __init__.py imports fine and then raises ImportError the first time
+    # a caller touches either method — the break does not show up until run
+    # time. Glob so a new module cannot be forgotten here again.
     files = {
+        f"{NAME}/{source.name}": source.read_bytes()
+        for source in sorted(package.glob("*.py"))
+    }
 
-        f"{NAME}/__init__.py":
-
-            (root / "python" / NAME / "__init__.py").read_bytes(),
+    files.update({
 
         f"{dist_info}/METADATA": (
 
@@ -72,7 +80,7 @@ def main() -> int:
 
         f"{dist_info}/top_level.txt": b"shibadb\n",
 
-    }
+    })
 
     rows = [
 
