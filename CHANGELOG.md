@@ -62,16 +62,23 @@ C ABI and on-disk format remain frozen at v1.0.
   `SDB_POWERLOSS_LIBRARY`, preventing a release check from silently exercising
   a stale hard-coded build directory. Commit `d76f6ab` contains the original
   gate; the configurable-library hardening is in the current tree.
-- **Python binding wired into CTest (`python_binding`).** The Python
-  binding is back **in-tree** (`python/`) and is now exercised by the
-  suite (it had earlier been moved out of tree; see the rc1 entry below).
-  The current working tree registers 53 tests, including legacy encrypted
-  fixture, index-reclamation compatibility, installed C/C++ consumers, and an
-  isolated wheel-install conformance test.
-- **Packaging gates are now part of CTest.** The previously dormant external
-  install-consumer and Python wheel scripts are registered as serial packaging
-  tests. Enabling the gate exposed and fixed a stale `find_package(ShibaDB
-  0.1)` requirement after the package version moved to 1.0.
+- **Python binding wired into CTest.** The Python binding is back **in-tree**
+  (`python/`) and exercised by the suite (it had earlier been moved out of
+  tree; see the rc1 entry below). This entry described `python_binding`, which
+  was not accurate for a while: `522c876` removed the Python layer and
+  `c7a9aa8` restored it without the ctest registrations, so between those two
+  commits nothing ran the Python tests at all — that is how a wheel shipping
+  only `__init__.py` went unnoticed. The suites are registered again as
+  `python_cli`, `python_legacy_fixture`, `python_pytest` and `python_wheel`;
+  `test_python_binding.py` itself was deleted in `522c876` and has not come
+  back, so the wheel gate drives `test_cli.py` through the installed package
+  instead. The tree registers 67 ctest entries (the "53 tests" this entry used
+  to claim was already stale).
+- **Packaging gates are now part of CTest.** The external install-consumer and
+  Python wheel scripts run as serial packaging tests. Enabling the gate exposed
+  and fixed a stale `find_package(ShibaDB 0.1)` requirement after the package
+  version moved to 1.0. The wheel script went dormant again with the removal
+  above and is wired back up now.
 
 ### Portability
 - **Windows I/O and locking repaired.** Database identity exclusion now uses a
