@@ -441,11 +441,18 @@ sdb_status sdb_xchacha20poly1305_encrypt(
     uint8_t subkey[32];
     uint8_t ietf_nonce[12];
     uint8_t first_block[64];
+    /*
+     * The message stream starts at counter 1, so the largest accepted size
+     * must keep the final 32-bit block counter at or below UINT32_MAX —
+     * otherwise the counter wraps to 0 and reuses the Poly1305-key block.
+     * (size_t)(UINT32_MAX - 1) * 64 is far beyond any real page; the bound
+     * exists so the invariant holds by construction.
+     */
     if (key == NULL || nonce == NULL || tag == NULL
         || (aad == NULL && aad_size != 0U)
         || (plaintext == NULL && plaintext_size != 0U)
         || (ciphertext == NULL && plaintext_size != 0U)
-        || plaintext_size > (size_t)UINT32_MAX * 64U) {
+        || plaintext_size > (size_t)(UINT32_MAX - 1U) * 64U) {
         return SDB_E_INVALID_ARGUMENT;
     }
 
@@ -495,7 +502,7 @@ sdb_status sdb_xchacha20poly1305_decrypt(
         || (aad == NULL && aad_size != 0U)
         || (ciphertext == NULL && ciphertext_size != 0U)
         || (plaintext == NULL && ciphertext_size != 0U)
-        || ciphertext_size > (size_t)UINT32_MAX * 64U) {
+        || ciphertext_size > (size_t)(UINT32_MAX - 1U) * 64U) {
         return SDB_E_INVALID_ARGUMENT;
     }
 

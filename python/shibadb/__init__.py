@@ -43,7 +43,9 @@ class _Options(ctypes.Structure):
         ("kdf_iterations", ctypes.c_uint32),
         ("password", _u8_p),
         ("password_size", ctypes.c_size_t),
-        ("reserved", ctypes.c_uint64 * 4),
+        ("cache_bytes", ctypes.c_uint64),
+        ("synchronous", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 2),
     ]
 
 class _IndexTerm(ctypes.Structure):
@@ -316,12 +318,18 @@ def _document_expired(document: dict, now: float) -> bool:
     ) and expires_at <= now
 
 def _options(
-    password: bytes | str | None, page_size: int, kdf_iterations: int
+    password: bytes | str | None,
+    page_size: int,
+    kdf_iterations: int,
+    cache_bytes: int = 0,
+    synchronous: int = 0,
 ) -> tuple[_Options, object | None]:
     options = _Options()
     _lib.sdb_database_options_init(ctypes.byref(options))
     options.page_size = page_size
     options.kdf_iterations = kdf_iterations
+    options.cache_bytes = cache_bytes
+    options.synchronous = synchronous
     password_bytes = b"" if password is None else _bytes(password)
     storage, pointer = _buffer(password_bytes)
     options.password = pointer
@@ -370,8 +378,12 @@ class Database:
         password: bytes | str | None = None,
         page_size: int = 4096,
         kdf_iterations: int = 600000,
+        cache_bytes: int = 0,
+        synchronous: int = 0,
     ) -> "Database":
-        options, keepalive = _options(password, page_size, kdf_iterations)
+        options, keepalive = _options(
+            password, page_size, kdf_iterations, cache_bytes, synchronous
+        )
         handle = _database_p()
         status = _lib.sdb_database_create(
             _path(path), ctypes.byref(options), ctypes.byref(handle)
@@ -388,8 +400,12 @@ class Database:
         password: bytes | str | None = None,
         page_size: int = 4096,
         kdf_iterations: int = 600000,
+        cache_bytes: int = 0,
+        synchronous: int = 0,
     ) -> "Database":
-        options, keepalive = _options(password, page_size, kdf_iterations)
+        options, keepalive = _options(
+            password, page_size, kdf_iterations, cache_bytes, synchronous
+        )
         handle = _database_p()
         status = _lib.sdb_database_open(
             _path(path), ctypes.byref(options), ctypes.byref(handle)
@@ -879,8 +895,12 @@ class Database:
         password: bytes | str | None,
         page_size: int,
         kdf_iterations: int,
+        cache_bytes: int = 0,
+        synchronous: int = 0,
     ) -> dict[str, int]:
-        options, keepalive = _options(password, page_size, kdf_iterations)
+        options, keepalive = _options(
+            password, page_size, kdf_iterations, cache_bytes, synchronous
+        )
         result = _CompactResult()
         if target_version is None:
             status = _lib.sdb_database_compact(
@@ -906,12 +926,16 @@ class Database:
         password: bytes | str | None = None,
         page_size: int = 4096,
         kdf_iterations: int = 600000,
+        cache_bytes: int = 0,
+        synchronous: int = 0,
     ) -> dict[str, int]:
         return self._rewrite(
             target_version=None,
             password=password,
             page_size=page_size,
             kdf_iterations=kdf_iterations,
+            cache_bytes=cache_bytes,
+            synchronous=synchronous,
         )
 
     def migrate(
@@ -921,12 +945,16 @@ class Database:
         password: bytes | str | None = None,
         page_size: int = 4096,
         kdf_iterations: int = 600000,
+        cache_bytes: int = 0,
+        synchronous: int = 0,
     ) -> dict[str, int]:
         return self._rewrite(
             target_version=target_version,
             password=password,
             page_size=page_size,
             kdf_iterations=kdf_iterations,
+            cache_bytes=cache_bytes,
+            synchronous=synchronous,
         )
 
 class Transaction:

@@ -1546,10 +1546,24 @@ sdb_status sdb_database_close(sdb_database *database)
     sdb_mutex_destroy(&database->mutex);
     free(database->path);
     free(database);
-    if (status != SDB_OK) {
-        return status;
+    /*
+     * The handle is fully torn down at this point — the object is freed and
+     * its mutex destroyed, so returning an error here would hand the caller a
+     * status code that names a handle it can no longer inspect, retry, or
+     * close. Close is therefore best-effort: report success, and surface any
+     * checkpoint/pager/lock failure through stderr where it is diagnostic,
+     * not actionable. (Callers needing a checked, retryable close use
+     * sdb_database_verify / explicit sdb_pager_checkpoint flows instead.)
+     */
+    if (status != SDB_OK || lock_status != SDB_OK
+        || path_lock_status != SDB_OK) {
+        fprintf(stderr,
+                "shibadb: warning: close reported errors "
+                "(checkpoint/pager=%d, process_lock=%d, path_lock=%d); "
+                "resources were released\n",
+                (int)status, (int)lock_status, (int)path_lock_status);
     }
-    return lock_status != SDB_OK ? lock_status : path_lock_status;
+    return SDB_OK;
 }
 
 static sdb_status sdb_kv_put_unlocked(

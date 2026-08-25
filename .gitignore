@@ -33,3 +33,8 @@ mempalace.yaml
 *.tmp.wal
 *.tmp.db
 *.tmp.tmp-*
+
+# Scratch WAL/lock artifacts from running the test binaries in-tree
+*.tmp.wal
+*.tmp.lock
+*.tmp.tmp-*

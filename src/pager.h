@@ -194,6 +194,18 @@ sdb_status sdb_pager_store_superblock(
     sdb_pager *pager, const sdb_superblock_v1 *next
 );
 sdb_status sdb_pager_checkpoint(sdb_pager *pager);
+/*
+ * DIRECT-WRITE SURFACE — WAL-BYPASSING, CREATE-TIME ONLY.
+ *
+ * sdb_pager_allocate/free/write mutate the data file and superblock directly,
+ * WITHOUT going through the WAL. Mixing them with sdb_txn_commit breaks the
+ * recovery invariant (the data file must lag the WAL up to checkpoint_lsn).
+ *
+ * The engine itself calls these only during database creation
+ * (sdb_btree_create seeding the root page) before any transaction exists.
+ * Runtime code must stage pages through sdb_txn_* instead. They stay internal
+ * (src/pager.h) and are exercised directly only by fault-injection tests.
+ */
 sdb_status sdb_pager_allocate(sdb_pager *pager, uint64_t *page_id_out);
 sdb_status sdb_pager_free(sdb_pager *pager, uint64_t page_id);
 sdb_status sdb_pager_write(

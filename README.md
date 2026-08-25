@@ -142,7 +142,8 @@ Windows. No third-party runtime dependencies.
 sudo cmake --install build
 ```
 
-Installs headers to `<prefix>/include/shibadb.h` and `shibadb_engine.h`, the
+Installs headers to `<prefix>/include/shibadb.h`, `shibadb_engine.h`, and
+`shibadb_visibility.h`, the
 static and shared libraries to `<prefix>/lib/`, plus CMake package config
 and pkg-config files.
 
@@ -150,7 +151,7 @@ and pkg-config files.
 
 ```cmake
 find_package(shibadb CONFIG REQUIRED)
-target_link_libraries(myapp PRIVATE shibadb::shibadb)
+target_link_libraries(myapp PRIVATE ShibaDB::shared)
 ```
 
 ### Use with pkg-config

@@ -1223,17 +1223,25 @@ sdb_status sdb_wal_recover_all(
                               superblock->file_id
                           )) {
                 /*
-                 * Bug a fix: the identity header sector is torn/damaged
+                 * Bug fix: the identity header sector is torn/damaged
                  * (crc_ok == false) but the self-describing v4 frames and
                  * their commit-record are intact. Trust the frames rather
                  * than falling back to the v3 stride, which would scan a
                  * 24+page_size layout with an 8+page_size step, miss the
                  * commit magic, and silently drop every committed txn.
+                 *
+                 * The data_key == NULL refusal here was a misplaced
+                 * anti-forgery gate: for an UNENCRYPTED database there is
+                 * no key material at all, and the frames are still fully
+                 * authenticated by the running-CRC32 sealed in the
+                 * commit-record (the same guarantee the torn-header v5 path
+                 * above accepts). Refusing here permanently bricked an
+                 * unencrypted database whose header sector happened to be
+                 * torn by a crash, even though every committed txn was
+                 * intact. The real keyless-forgery gate lives in
+                 * sdb_wal_validate_frames (encrypted DBs only), where it
+                 * belongs.
                  */
-                if (data_key == NULL) {
-                    free(buffer);
-                    return SDB_E_CORRUPT;
-                }
                 use_self_describing = true;
                 record_header_size = SDB_WAL_RECORD_HEADER_SIZE_V4;
             }

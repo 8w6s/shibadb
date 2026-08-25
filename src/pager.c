@@ -2146,6 +2146,15 @@ bool sdb_pager_take_pending(sdb_pager *pager, uint64_t *txn_id_out)
  * the WAL is never left with a durable-gap in front of an acknowledged txn. On
  * fsync error the coordinator is poisoned (sticky commit_failed); every waiter
  * then observes the error and no txn is ever reported durable falsely.
+ *
+ * SEMANTICS NOTE (documented trade-off, shared with every WAL-based storage
+ * engine): when the fsync fails, the transaction's bytes have already been
+ * pwritten into the WAL and there is no abort marker — on the NEXT open,
+ * recovery finds a CRC-valid commit-record and replays the txn as committed.
+ * So a caller that receives SDB_E_IO from commit cannot assume "error ⇒ not
+ * applied": the txn MAY be (and usually is) durable anyway. Callers that need
+ * to know must read back after reopening. Within the failing session the
+ * poisoned coordinator refuses further commits until restart.
  */
 static sdb_status sdb_pager_fsync_locked(sdb_pager *pager)
 {

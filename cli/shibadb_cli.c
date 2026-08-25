@@ -59,6 +59,50 @@ static void cli_options_init(cli_options *opts) {
  * flag (message already printed). Unknown --flags are an error so typos fail
  * loudly rather than being silently ignored as positionals.
  */
+/*
+ * Strict unsigned parsing for option values: the whole argument must be a
+ * decimal number in range. Unlike bare strtoul/strtoull, garbage like
+ * "--page-size abc" or "12abc" fails loudly instead of silently degrading
+ * to 0 (= engine default).
+ */
+static int cli_parse_u32(const char *text, uint32_t *out, const char *flag) {
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] == '\0') {
+        goto bad;
+    }
+    value = strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || value > 0xFFFFFFFFULL) {
+        goto bad;
+    }
+    *out = (uint32_t)value;
+    return 0;
+bad:
+    fprintf(stderr, "shibadb: %s requires an integer value, got '%s'\n",
+            flag, text != NULL ? text : "");
+    return -1;
+}
+
+static int cli_parse_u64(const char *text, uint64_t *out, const char *flag) {
+    char *end = NULL;
+    unsigned long long value;
+
+    if (text == NULL || text[0] == '\0') {
+        goto bad;
+    }
+    value = strtoull(text, &end, 10);
+    if (end == text || *end != '\0') {
+        goto bad;
+    }
+    *out = (uint64_t)value;
+    return 0;
+bad:
+    fprintf(stderr, "shibadb: %s requires an integer value, got '%s'\n",
+            flag, text != NULL ? text : "");
+    return -1;
+}
+
 static int cli_parse_options(int argc, char **argv, cli_options *opts,
                              char **out_argv, int *out_argc) {
     int positional = 0;
@@ -81,19 +125,29 @@ static int cli_parse_options(int argc, char **argv, cli_options *opts,
                 fprintf(stderr, "shibadb: --page-size requires a value\n");
                 return -1;
             }
-            opts->page_size = (uint32_t)strtoul(argv[++i], NULL, 10);
-        } else if (strcmp(arg, "--kdf-iterations") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "shibadb: --kdf-iterations requires a value\n");
+            if (cli_parse_u32(argv[++i], &opts->page_size, "--page-size")
+                != 0) {
                 return -1;
             }
-            opts->kdf_iterations = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(arg, "--kdf-iterations") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr,
+                        "shibadb: --kdf-iterations requires a value\n");
+                return -1;
+            }
+            if (cli_parse_u32(argv[++i], &opts->kdf_iterations,
+                              "--kdf-iterations")
+                != 0) {
+                return -1;
+            }
         } else if (strcmp(arg, "--limit") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "shibadb: --limit requires a value\n");
                 return -1;
             }
-            opts->limit = (uint64_t)strtoull(argv[++i], NULL, 10);
+            if (cli_parse_u64(argv[++i], &opts->limit, "--limit") != 0) {
+                return -1;
+            }
         } else if (strcmp(arg, "--synchronous") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "shibadb: --synchronous requires a value\n");
@@ -163,12 +217,24 @@ static void fill_db_options(sdb_database_options *db_opts,
     db_opts->synchronous = opts->synchronous;
 }
 
-/* Map an sdb_status to a small non-zero process exit code (2..) . */
+/*
+ * Map an sdb_status to a small non-zero process exit code. Distinct codes for
+ * the outcomes scripts actually branch on; everything else funnels to 2.
+ *   0 success, 2 engine error, 3 not-found, 4 busy/contention, 5 corrupt.
+ */
 static int exit_code_for(sdb_status status) {
-    if (status == SDB_OK) {
+    switch (status) {
+    case SDB_OK:
         return 0;
+    case SDB_E_NOT_FOUND:
+        return 3;
+    case SDB_E_BUSY:
+        return 4;
+    case SDB_E_CORRUPT:
+        return 5;
+    default:
+        return 2;
     }
-    return 2;
 }
 
 static int fail(const char *context, sdb_status status) {
@@ -271,30 +337,16 @@ static int cmd_get(const char *path, const char *ns, const char *key,
     if (st != SDB_OK) {
         return fail("open", st);
     }
-    /* Probe size first, then allocate exactly. */
-    size_t needed = 0;
-    st = sdb_kv_get(db, (const uint8_t *)ns, strlen(ns),
-                    (const uint8_t *)key, strlen(key), NULL, 0, &needed);
-    if (st != SDB_OK && st != SDB_E_BUFFER_TOO_SMALL) {
-        (void)sdb_database_close(db);
-        return fail("get", st);
-    }
+    /* One allocating call — no probe/read race (values can grow between
+     * the two calls of the manual pattern; get_alloc handles it all). */
     uint8_t *buf = NULL;
-    if (needed > 0) {
-        buf = (uint8_t *)malloc(needed);
-        if (buf == NULL) {
-            (void)sdb_database_close(db);
-            fprintf(stderr, "shibadb: get: out of memory\n");
-            return 2;
-        }
-    }
     size_t got = 0;
-    st = sdb_kv_get(db, (const uint8_t *)ns, strlen(ns),
-                    (const uint8_t *)key, strlen(key), buf, needed, &got);
+    st = sdb_kv_get_alloc(db, (const uint8_t *)ns, strlen(ns),
+                          (const uint8_t *)key, strlen(key), &buf, &got);
     if (st == SDB_OK && got > 0) {
         fwrite(buf, 1, got, stdout);
     }
-    free(buf);
+    sdb_free(buf);
     sdb_status close_st = sdb_database_close(db);
     if (st != SDB_OK) {
         return fail("get", st);
@@ -610,15 +662,25 @@ static int cmd_docget(const char *path, const char *collection, const char *id,
     if (st != SDB_OK) {
         return fail("open", st);
     }
+    /*
+     * Probe-then-read via the raw sdb_document_get() (no allocating
+     * convenience wrapper exists for documents). A value that grows between
+     * the two calls yields SDB_E_BUFFER_TOO_SMALL on the second call; retry
+     * a bounded number of times before giving up.
+     */
     size_t needed = 0;
-    st = sdb_document_get(db, (const uint8_t *)collection, strlen(collection),
-                          (const uint8_t *)id, strlen(id), NULL, 0, &needed);
-    if (st != SDB_OK && st != SDB_E_BUFFER_TOO_SMALL) {
-        (void)sdb_database_close(db);
-        return fail("docget", st);
-    }
     uint8_t *buf = NULL;
-    if (needed > 0) {
+    size_t got = 0;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        st = sdb_document_get(db, (const uint8_t *)collection,
+                              strlen(collection), (const uint8_t *)id,
+                              strlen(id), buf, needed, &got);
+        if (st != SDB_E_BUFFER_TOO_SMALL) {
+            break;
+        }
+        free(buf);
+        buf = NULL;
+        needed = got;
         buf = (uint8_t *)malloc(needed);
         if (buf == NULL) {
             (void)sdb_database_close(db);
@@ -626,9 +688,6 @@ static int cmd_docget(const char *path, const char *collection, const char *id,
             return 2;
         }
     }
-    size_t got = 0;
-    st = sdb_document_get(db, (const uint8_t *)collection, strlen(collection),
-                          (const uint8_t *)id, strlen(id), buf, needed, &got);
     if (st == SDB_OK && got > 0) {
         fwrite(buf, 1, got, stdout);
         fputc('\n', stdout);

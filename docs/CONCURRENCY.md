@@ -32,6 +32,17 @@ commit is on stable storage before its call returns — while the fsync cost is
 amortised across a batch of concurrent committers. See `test_group_commit` and
 `test_group_commit_batch`.
 
+### Commit-error semantics
+
+If the group-commit fsync fails, every waiter receives an I/O error and the
+commit coordinator is poisoned for the rest of the session — no further commit
+is acknowledged until the database is closed and reopened. One caveat shared
+with every WAL-based engine: the transaction's bytes were already appended to
+the WAL before the fsync, so on the NEXT successful open, recovery replays it
+as committed even though the caller saw an error. An `SDB_E_IO` from commit
+therefore means "unknown outcome", not "not applied" — read back after
+reopening if you must know.
+
 One public transaction may also be shared by application threads. Individual
 transaction calls use the owning database mutex, so they are serialized and
 provide read-your-writes over a single staged tree. Commit, rollback, and
