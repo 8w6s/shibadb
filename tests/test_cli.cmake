@@ -58,8 +58,8 @@ if(NOT out STREQUAL "{role:admin}")
     message(FATAL_ERROR "get alice: got '${out}'")
 endif()
 
-# missing key -> non-zero, no stdout
-run(2 out get "${DB}" users nope)
+# missing key -> exit code 3 (SDB_E_NOT_FOUND), no stdout
+run(3 out get "${DB}" users nope)
 if(NOT out STREQUAL "")
     message(FATAL_ERROR "missing get printed: '${out}'")
 endif()
@@ -80,7 +80,7 @@ expect_contains("${out}" "users" "namespaces")
 
 # delete then miss
 run(0 out del "${DB}" users bob)
-run(2 out get "${DB}" users bob)
+run(3 out get "${DB}" users bob)
 
 # verify + info
 run(0 out verify "${DB}")
@@ -147,7 +147,7 @@ run(0 out find "${DB}" people by_role admin)
 expect_contains("${out}" "u1" "find match u1")
 expect_contains("${out}" "u2" "find match u2")
 run(0 out docdel "${DB}" people u1)
-run(2 out docget "${DB}" people u1)   # deleted -> not found (exit 2)
+run(3 out docget "${DB}" people u1)   # deleted -> not found (exit 3)
 
 # --- misuse: non-zero, not a crash ---
 run(1 out get "${DB}")
