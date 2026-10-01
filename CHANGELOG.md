@@ -161,6 +161,10 @@ C ABI and on-disk format remain frozen at v1.0.
 - **CI build and test failures surface excerpts as check annotations.** This
   preserves actionable diagnostics when the Actions log archive cannot be
   downloaded by the agent.
+- **Mixed-workload compaction synchronizes with live writers.** The test now
+  waits for each writer's first put before entering the compact loop,
+  so its `SDB_E_BUSY` assertion measures concurrency instead of thread-startup
+  timing.
 - **New `sanitizers-gcc` CI job.** The Clang-only sanitizer job could not see
   that failure, because Clang uses the dynamic ASan runtime for shared
   libraries. New `sanitize-gcc` configure/build/test presets plus a CI job keep

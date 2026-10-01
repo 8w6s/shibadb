@@ -1,6 +1,6 @@
 /*
  * Mixed-workload concurrency stress. A single shared sdb_database handle is
- * driven simultaneously by four kinds of thread:
+ * driven simultaneously by four work loops:
  *   - writers      : auto-commit puts of deterministic, write-once keys
  *   - readers      : gets of those keys, racing the writers
  *   - a backup loop : sdb_database_backup in a tight loop
@@ -28,6 +28,19 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
+#endif
+
+/*
+ * Use the compiler atomics outside MSVC so the writer-start handshake remains
+ * visible to ThreadSanitizer without requiring C11 atomics from older MSVC.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define STARTED_STORE(flag_) (void)InterlockedExchange(&(flag_), 1L)
+#define STARTED_LOAD(flag_) (InterlockedCompareExchange(&(flag_), 0L, 0L) != 0L)
+#else
+#define STARTED_STORE(flag_) __atomic_store_n(&(flag_), 1L, __ATOMIC_RELEASE)
+#define STARTED_LOAD(flag_) (__atomic_load_n(&(flag_), __ATOMIC_ACQUIRE) != 0L)
 #endif
 
 #define WRITER_THREADS 8U
@@ -74,6 +87,7 @@ typedef struct writer_context {
     uint32_t worker;
     bool failed;
     int fail_status;
+    long started;
 } writer_context;
 
 typedef struct reader_context {
@@ -94,6 +108,20 @@ typedef struct loop_context {
     int fail_status;
 } loop_context;
 
+/*
+ * Yield while waiting for the writer handshakes; this sleep is outside the
+ * measured workload window.
+ */
+static void short_sleep(void)
+{
+#ifdef _WIN32
+    Sleep(1U);
+#else
+    const struct timespec delay = {0, 1000000L};
+    (void)nanosleep(&delay, NULL);
+#endif
+}
+
 static void run_writer(writer_context *context)
 {
     uint32_t record;
@@ -107,6 +135,9 @@ static void run_writer(writer_context *context)
             context->database, namespace_name, sizeof(namespace_name),
             key, sizeof(key), value, sizeof(value)
         );
+        if (record == 0U) {
+            STARTED_STORE(context->started);
+        }
         if (status != SDB_OK) {
             context->failed = true;
             context->fail_status = (int)status;
@@ -244,16 +275,6 @@ static THREAD_RET backup_entry(void *argument)
 #endif
 }
 
-static THREAD_RET compact_entry(void *argument)
-{
-    run_compact_loop((loop_context *)argument);
-#ifdef _WIN32
-    return 0U;
-#else
-    return NULL;
-#endif
-}
-
 #ifdef _WIN32
 static THREAD_HANDLE spawn(LPTHREAD_START_ROUTINE fn, void *arg)
 {
@@ -312,7 +333,6 @@ int main(void)
     THREAD_HANDLE writer_threads[WRITER_THREADS];
     THREAD_HANDLE reader_threads[READER_THREADS];
     THREAD_HANDLE backup_thread;
-    THREAD_HANDLE compact_thread;
     uint32_t index;
     size_t total_found = 0U;
     size_t total_missing = 0U;
@@ -343,14 +363,15 @@ int main(void)
     compact_ctx.fail_status = 0;
 
     /*
-     * Launch every kind of worker together so readers, backup and compact all
-     * overlap the writers' commit/durability windows.
+     * Launch writers, readers and backup first. The main thread enters the
+     * compact loop after the writers' start handshake below.
      */
     for (index = 0U; index < WRITER_THREADS; ++index) {
         writers[index].database = database;
         writers[index].worker = index;
         writers[index].failed = false;
         writers[index].fail_status = 0;
+        writers[index].started = 0L;
         writer_threads[index] = spawn(writer_entry, &writers[index]);
     }
     for (index = 0U; index < READER_THREADS; ++index) {
@@ -362,7 +383,18 @@ int main(void)
         reader_threads[index] = spawn(reader_entry, &readers[index]);
     }
     backup_thread = spawn(backup_entry, &backup_ctx);
-    compact_thread = spawn(compact_entry, &compact_ctx);
+
+    /*
+     * Thread creation is not thread start. Wait until every writer has
+     * completed one put, then compact while the remaining writes are active.
+     */
+    for (index = 0U; index < WRITER_THREADS; ++index) {
+        while (!STARTED_LOAD(writers[index].started)) {
+            short_sleep();
+        }
+    }
+    run_compact_loop(&compact_ctx);
+    assert(!compact_ctx.failed);
 
     for (index = 0U; index < WRITER_THREADS; ++index) {
         join(writer_threads[index]);
@@ -376,8 +408,6 @@ int main(void)
     }
     join(backup_thread);
     assert(!backup_ctx.failed);
-    join(compact_thread);
-    assert(!compact_ctx.failed);
 
     /*
      * Both maintenance loops must have actually run against a live committer:
