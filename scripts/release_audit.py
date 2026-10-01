@@ -8,12 +8,58 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tokenize
 
 from release_evidence import load_ci_evidence, load_security_audit_evidence
+from strip_c_comments import strip as strip_c_comments
+from strip_py_comments import strip_comments as strip_py_comments
 
 FORBIDDEN_DEPENDENCIES = re.compile(
     rb"sqlite|libcrypto|openssl|libsodium", re.IGNORECASE
 )
+
+def dependency_scan_bytes(path: Path) -> bytes:
+    suffix = path.suffix.lower()
+    if suffix in (".c", ".h"):
+        try:
+            return strip_c_comments(path.read_text(encoding="utf-8")).encode(
+                "utf-8"
+            )
+        except (OSError, UnicodeDecodeError):
+            return path.read_bytes()
+    if suffix == ".py":
+        try:
+            source = path.read_text(encoding="utf-8")
+            return strip_py_comments(source).encode("utf-8")
+        except (
+            OSError,
+            UnicodeDecodeError,
+            SyntaxError,
+            ValueError,
+            tokenize.TokenError,
+        ):
+            return path.read_bytes()
+    return path.read_bytes()
+
+def read_symbol_allowlist(path: Path) -> list[str]:
+    symbols = []
+    for line in path.read_text(encoding="ascii").splitlines():
+        name = line.strip()
+        if not name or name.startswith("#"):
+            continue
+        symbols.append(name.removeprefix("_"))
+    return sorted(set(symbols))
+
+def exported_public_symbols(nm_output: str) -> list[str]:
+    symbols = []
+    for line in nm_output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        name = fields[-1].removeprefix("_")
+        if name.startswith("sdb_"):
+            symbols.append(name)
+    return sorted(set(symbols))
 
 def ci_evidence(
     path: str | None,
@@ -155,10 +201,12 @@ def main() -> int:
     for directory in ("src", "include", "python"):
         for path in (root / directory).rglob("*"):
             if path.is_file() and "__pycache__" not in path.parts:
-                data = path.read_bytes()
-                scanned.append(str(path.relative_to(root)))
-                if FORBIDDEN_DEPENDENCIES.search(data):
-                    forbidden_hits.append(str(path.relative_to(root)))
+                relative = str(path.relative_to(root))
+                scanned.append(relative)
+                if FORBIDDEN_DEPENDENCIES.search(
+                    dependency_scan_bytes(path)
+                ):
+                    forbidden_hits.append(relative)
     checks: dict[str, bool] = {
         "no_forbidden_database_or_crypto_dependency": not forbidden_hits,
         "distribution_license_selected": (root / "LICENSE").is_file(),
@@ -201,15 +249,18 @@ def main() -> int:
             text=True,
             capture_output=True,
         )
-        symbols = sorted(
-            line.split()[-1] for line in nm.stdout.splitlines() if line.split()
-        )
-        expected = sorted(
-            (root / "abi" / "symbols-v1.txt")
-            .read_text(encoding="ascii")
-            .splitlines()
-        )
+        symbols = exported_public_symbols(nm.stdout)
+        expected = read_symbol_allowlist(root / "abi" / "symbols-v1.txt")
         checks["shared_symbol_allowlist"] = symbols == expected
+        if symbols != expected:
+            details["symbol_allowlist_diff"] = {
+                "exported_not_allowlisted": sorted(
+                    set(symbols) - set(expected)
+                ),
+                "allowlisted_not_exported": sorted(
+                    set(expected) - set(symbols)
+                ),
+            }
         dynamic = subprocess.run(
             [arguments.readelf, "-d", str(arguments.library)],
             check=True,
