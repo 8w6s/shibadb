@@ -102,6 +102,14 @@ C ABI and on-disk format remain frozen at v1.0.
   could drop the page encryption envelope; the target now preserves it.
 - **Python binding closed the handle on `SDB_E_BUSY`.** The binding no
   longer tears down the underlying database on a BUSY result.
+- **Clang ThinLTO made the public static archive unreadable to ordinary links.**
+  Clang now keeps `shibadb_core` in native object format and retains IPO for
+  the shared library, whose compile and link are controlled by this build.
+- **ARM64 builds received x86-only SIMD flags.** SHA-NI and AVX2 translation
+  units and their ISA flags are now included only for x86 targets.
+- **Windows CTest used Linux-only release tooling.** `release_audit` now runs
+  only on Linux ELF artifacts, and the Windows ABI gate prefers
+  `dumpbin /EXPORTS` over nm-style dumpers.
 
 ### Security
 - **`data_key` scrubbed after compact.** Compact's stale `data_key` copy is
@@ -141,16 +149,18 @@ C ABI and on-disk format remain frozen at v1.0.
   version moved to 1.0. The wheel script went dormant again with the removal
   above and is wired back up now.
 
-- **Python binding now survives the sanitizer preset.** Under GCC all four
-  `python_*` tests failed with "ASan runtime does not come first in initial
-  library list": GCC links `libasan` statically into `shibadb_shared`, and a
-  stock interpreter that dlopens it aborts at load. CMake now asks the compiler
-  where its runtime lives (`-print-file-name=libasan.so` / `libtsan.so`) and
-  preloads it for those tests, so the binding stays under sanitizer coverage
-  instead of being skipped. LeakSanitizer is disabled for the
-  interpreter-driven tests only — it was reporting CPython's own deliberate
-  shutdown allocations (`PyType_GenericAlloc`, `_PyCode_New`) as leaks. Leak
+- **Python binding now runs under the sanitizer presets.** CMake discovers and
+  preloads the active ASan/UBSan or TSan runtime before a stock interpreter
+  dlopens `shibadb_shared`; this also resolves Clang's UBSan handler symbols.
+  LeakSanitizer is disabled only for interpreter-driven tests — CPython keeps
+  deliberate shutdown allocations (`PyType_GenericAlloc`, `_PyCode_New`). Leak
   detection stays on for every C test, where this library's allocations live.
+- **Hosted CTest jobs install pytest before configuration.** Without it,
+  `python_pytest` was registered by CMake but failed immediately on clean
+  runners that did not have the optional package installed.
+- **CI build and test failures surface excerpts as check annotations.** This
+  preserves actionable diagnostics when the Actions log archive cannot be
+  downloaded by the agent.
 - **New `sanitizers-gcc` CI job.** The Clang-only sanitizer job could not see
   that failure, because Clang uses the dynamic ASan runtime for shared
   libraries. New `sanitize-gcc` configure/build/test presets plus a CI job keep

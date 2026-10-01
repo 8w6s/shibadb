@@ -12,8 +12,8 @@
 #   LIBRARY   shared library to inspect ($<TARGET_FILE:shibadb_shared>)
 #   EXPECTED  path to the allowlist
 # Optional input:
-#   NM        symbol dumper; when omitted, llvm-nm, nm and dumpbin are tried in
-#             turn so Linux, macOS and MSVC need no per-platform wiring here.
+#   NM        symbol dumper; when omitted, a platform-appropriate dumper is
+#             selected from llvm-nm, nm and dumpbin.
 #
 # Only defined, external symbols matching ^_?sdb_ are compared. Synthesised
 # runtime symbols (_init/_fini/__bss_start on ELF, __mh_execute_header on
@@ -32,10 +32,17 @@ if(NOT EXISTS "${EXPECTED}")
     message(FATAL_ERROR "Allowlist not found: ${EXPECTED}")
 endif()
 
+# Prefer dumpbin on Windows so DLL exports are read from the PE export table;
+# other hosts try llvm-nm and nm first.
 # An explicitly supplied NM always wins so a cross-build can point at its own
 # binutils.
 if(NOT DEFINED NM OR NM STREQUAL "")
-    foreach(sdb_candidate llvm-nm nm dumpbin)
+    if(CMAKE_HOST_WIN32 OR WIN32)
+        set(sdb_dumper_candidates dumpbin llvm-nm nm)
+    else()
+        set(sdb_dumper_candidates llvm-nm nm dumpbin)
+    endif()
+    foreach(sdb_candidate IN LISTS sdb_dumper_candidates)
         find_program(SDB_DUMPER_${sdb_candidate} ${sdb_candidate})
         if(SDB_DUMPER_${sdb_candidate})
             set(NM "${SDB_DUMPER_${sdb_candidate}}")
@@ -51,8 +58,8 @@ if(NOT DEFINED NM OR NM STREQUAL "")
 endif()
 get_filename_component(sdb_nm_name "${NM}" NAME)
 
-# GNU/llvm nm accept -D --defined-only on ELF and PE; Apple's cctools nm
-# rejects -D and wants -gU; MSVC has no nm and needs dumpbin /EXPORTS. Each
+# GNU/llvm nm accept -D --defined-only on ELF; Apple's cctools nm rejects
+# -D and wants -gU; MSVC DLLs use dumpbin /EXPORTS. Each
 # style is tried until one exits 0 AND its output mentions an sdb_ symbol, so a
 # tool that accepts a flag but misreads the format falls through instead of
 # silently yielding an empty set -- an empty set would otherwise look like a
