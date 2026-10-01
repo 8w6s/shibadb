@@ -217,7 +217,16 @@ sdb_status sdb_replace_recover(
     char *marker_path = NULL;
     char *temporary_path = NULL;
     uint8_t marker[SDB_REPLACE_MARKER_SIZE];
-    uint8_t replacement_file_id[SDB_FILE_ID_SIZE];
+    /*
+     * Zero-initialised rather than left for sdb_replace_marker_decode to fill:
+     * the memcmp below is guarded by `status == SDB_OK &&`, so a failed decode
+     * never reaches it, but that safety depends on a short-circuit a reader has
+     * to reconstruct from the decoder's contract. Starting defined makes the
+     * path unconditionally sound and keeps static analysers (cppcheck flags
+     * this as uninitvar) from reporting a defect that is only absent by
+     * argument-ordering.
+     */
+    uint8_t replacement_file_id[SDB_FILE_ID_SIZE] = {0};
     sdb_status status;
     if (current_file_id == NULL) {
         return SDB_E_INVALID_ARGUMENT;
