@@ -3,6 +3,40 @@ project(shibadb_c VERSION 1.0.0 LANGUAGES C)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(CheckSymbolExists)
+
+# Secure-zeroisation primitives for sdb_secure_zero (src/sha256.c).
+#
+# Detected at configure time rather than selected from platform macros: the
+# visibility of explicit_bzero depends on the *feature-macro combination*, not
+# just the OS. This project compiles with C_EXTENSIONS OFF plus
+# _POSIX_C_SOURCE=200809L and _XOPEN_SOURCE=700, which suppresses glibc's
+# implicit _DEFAULT_SOURCE and therefore hides explicit_bzero behind
+# __USE_MISC; musl gates it on _BSD_SOURCE the same way. The check below
+# compiles with the exact macros the library uses, so a platform only gets the
+# fast path when the declaration is genuinely reachable. Anything undetected
+# keeps the portable volatile-byte fallback -- slower but always correct, so a
+# miss here costs performance, never a build.
+# NOTE: unlike target_compile_definitions, CMAKE_REQUIRED_DEFINITIONS is spliced
+# onto the compiler command line verbatim -- entries must carry their own -D.
+# Omitting it made gcc treat "_DEFAULT_SOURCE=1" as an input file, the check
+# failed, and the miss looked like "glibc has no explicit_bzero" instead of
+# "the check never compiled". cl.exe accepts -D as an alias for /D, so this
+# form is correct on MSVC too.
+set(CMAKE_REQUIRED_QUIET TRUE)
+set(CMAKE_REQUIRED_DEFINITIONS
+    -D_DEFAULT_SOURCE=1 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700
+)
+check_symbol_exists(explicit_bzero "string.h;strings.h" SDB_HAVE_EXPLICIT_BZERO)
+# memset_s is C11 Annex K and only declared when the TU asks for it. Apple
+# provides it and not explicit_bzero, so this is the macOS fast path.
+set(CMAKE_REQUIRED_DEFINITIONS -D__STDC_WANT_LIB_EXT1__=1)
+check_symbol_exists(memset_s "string.h" SDB_HAVE_MEMSET_S)
+unset(CMAKE_REQUIRED_DEFINITIONS)
+message(STATUS
+    "ShibaDB: secure zeroisation -- explicit_bzero="
+    "${SDB_HAVE_EXPLICIT_BZERO} memset_s=${SDB_HAVE_MEMSET_S}"
+)
 
 option(SDB_BUILD_TESTS "Build ShibaDB C tests" ON)
 option(SDB_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -29,10 +63,17 @@ if(SDB_ENABLE_FUZZERS AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
     message(FATAL_ERROR "SDB_ENABLE_FUZZERS requires Clang (libFuzzer is a Clang feature)")
 endif()
 
+# The intrinsic kernels are valid only for x86 targets. Exclude them from the
+# source list elsewhere so non-x86 builds do not compile empty guarded files.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|x64|i[3-6]86)$")
+    set(SDB_TARGET_X86 TRUE)
+else()
+    set(SDB_TARGET_X86 FALSE)
+endif()
+
 set(SHIBADB_SOURCES
     src/btree.c
     src/btree_page.c
-    src/chacha_avx2.c
     src/checksum.c
     src/codec.c
     src/cpu_features.c
@@ -47,7 +88,6 @@ set(SHIBADB_SOURCES
     src/random.c
     src/replace.c
     src/sha256.c
-    src/sha256_shani.c
     src/status.c
     src/superblock.c
     src/superblock_store.c
@@ -58,6 +98,12 @@ set(SHIBADB_SOURCES
     src/windows_path.c
     src/xchacha20poly1305.c
 )
+if(SDB_TARGET_X86)
+    list(APPEND SHIBADB_SOURCES
+        src/chacha_avx2.c
+        src/sha256_shani.c
+    )
+endif()
 
 add_library(shibadb_core STATIC ${SHIBADB_SOURCES})
 add_library(shibadb_shared SHARED ${SHIBADB_SOURCES})
@@ -111,12 +157,33 @@ function(shibadb_configure_target target)
         target_compile_definitions(${target} PRIVATE
             _POSIX_C_SOURCE=200809L
             _XOPEN_SOURCE=700
+            # Re-expose the BSD/misc layer that _POSIX_C_SOURCE alone hides --
+            # glibc gates explicit_bzero behind __USE_MISC and musl behind
+            # _BSD_SOURCE, and neither is implied once _POSIX_C_SOURCE is set.
+            # Additive: it widens the declared set without changing the
+            # semantics of anything the tree already uses.
+            _DEFAULT_SOURCE
             # Force 64-bit off_t on 32-bit POSIX targets so pread/pwrite/
             # ftruncate offsets do not silently truncate uint64_t page
             # arithmetic. On 64-bit hosts this define is a no-op; on
             # 32-bit hosts it selects the LFS64 variants at libc.
             _FILE_OFFSET_BITS=64
         )
+        if(SDB_HAVE_EXPLICIT_BZERO)
+            target_compile_definitions(${target} PRIVATE
+                SDB_HAVE_EXPLICIT_BZERO=1
+            )
+        endif()
+        if(SDB_HAVE_MEMSET_S)
+            # __STDC_WANT_LIB_EXT1__ must be defined before <string.h> is first
+            # included in every translation unit, hence a compile definition
+            # rather than a per-file #define. Only set when the configure check
+            # actually found memset_s.
+            target_compile_definitions(${target} PRIVATE
+                SDB_HAVE_MEMSET_S=1
+                __STDC_WANT_LIB_EXT1__=1
+            )
+        endif()
         if(APPLE)
             # _POSIX_C_SOURCE hides Darwin-specific symbols
             # (F_FULLFSYNC, etc.). _DARWIN_C_SOURCE re-exposes them.
@@ -228,18 +295,20 @@ endif()
 # on GCC/Clang; the rest of the tree stays at baseline ISA so the binary still
 # runs on CPUs without those extensions. Runtime entry is gated by
 # sdb_cpu_features_get()->sha, so the instructions never execute unsupported.
-# MSVC emits these intrinsics with no special /arch flag.
-if(NOT MSVC)
-    set_source_files_properties(src/sha256_shani.c PROPERTIES
-        COMPILE_OPTIONS "-msse4.1;-msha")
-    set_source_files_properties(src/chacha_avx2.c PROPERTIES
-        COMPILE_OPTIONS "-mavx2")
-else()
-    # MSVC gates AVX2 intrinsics behind /arch:AVX2 (unlike the SHA intrinsics,
-    # which it emits unconditionally). Applied to just this file so the rest of
-    # the tree keeps its baseline ISA; runtime entry is gated by ->avx2.
-    set_source_files_properties(src/chacha_avx2.c PROPERTIES
-        COMPILE_OPTIONS "/arch:AVX2")
+# MSVC emits the SHA intrinsics without an ISA flag, but gates AVX2 behind
+# /arch:AVX2. Keep both source-specific flags off non-x86 targets.
+if(SDB_TARGET_X86)
+    if(NOT MSVC)
+        set_source_files_properties(src/sha256_shani.c PROPERTIES
+            COMPILE_OPTIONS "-msse4.1;-msha")
+        set_source_files_properties(src/chacha_avx2.c PROPERTIES
+            COMPILE_OPTIONS "-mavx2")
+    else()
+        # Apply the AVX2 flag only to its isolated kernel; runtime entry is
+        # gated by ->avx2, so every other translation unit keeps its baseline.
+        set_source_files_properties(src/chacha_avx2.c PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2")
+    endif()
 endif()
 
 # Link-time / interprocedural optimization for optimized builds. Enables
@@ -247,7 +316,9 @@ endif()
 # /GL + /LTCG), which matters for the hot crypto/pager/btree paths that call
 # across file boundaries. Guarded on toolchain support and an optimized build
 # type so Debug/coverage builds stay fast and debuggable, and disabled under
-# sanitizer/fuzzer builds where it interferes with instrumentation.
+# sanitizer/fuzzer builds where it interferes with instrumentation. Clang's
+# ThinLTO static archives contain bitcode-only members, so keep the exported
+# static target native and apply IPO only to the shared library.
 include(CheckIPOSupported)
 check_ipo_supported(RESULT sdb_ipo_supported OUTPUT sdb_ipo_output LANGUAGES C)
 if(sdb_ipo_supported
@@ -255,8 +326,13 @@ if(sdb_ipo_supported
    AND NOT SDB_ENABLE_SANITIZERS
    AND NOT SDB_ENABLE_THREAD_SANITIZER
    AND NOT SDB_ENABLE_FUZZERS)
-    set_target_properties(shibadb_core shibadb_shared PROPERTIES
-        INTERPROCEDURAL_OPTIMIZATION TRUE)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        set_target_properties(shibadb_shared PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION TRUE)
+    else()
+        set_target_properties(shibadb_core shibadb_shared PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
     message(STATUS "ShibaDB: IPO/LTO enabled for optimized build")
 elseif(NOT sdb_ipo_supported)
     message(STATUS "ShibaDB: IPO/LTO unavailable: ${sdb_ipo_output}")
@@ -600,6 +676,23 @@ if(SDB_BUILD_TESTS)
         endforeach()
     endif()
     add_test(NAME abi COMMAND test_abi)
+    # Second half of the "ABI layout and shared-symbol allowlist" release gate
+    # (RELEASE.md). test_abi freezes public struct layouts at compile time via
+    # _Static_assert; this freezes the *exported symbol set* of the shared
+    # library against abi/symbols-v1.txt, in both directions. Only the layout
+    # half was wired up, so the allowlist quietly went stale by 20 symbols --
+    # the whole cursor/scan/snapshot slice plus sdb_database_migrate_file,
+    # sdb_list_namespaces and sdb_version_number shipped outside the documented
+    # ABI v1 surface with CI green and docs/ABI.md still claiming the symbol
+    # table was compared "byte-for-byte". tests/check_symbols.cmake resolves
+    # llvm-nm / nm / dumpbin itself, so no per-platform branch is needed here.
+    add_test(
+        NAME abi_symbols
+        COMMAND ${CMAKE_COMMAND}
+            -DLIBRARY=$<TARGET_FILE:shibadb_shared>
+            -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/abi/symbols-v1.txt
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols.cmake
+    )
     add_test(NAME superblock COMMAND test_superblock)
     add_test(NAME database_info COMMAND test_database_info)
     add_test(NAME convenience COMMAND test_convenience)
@@ -715,6 +808,93 @@ if(SDB_BUILD_TESTS)
         set(SDB_PYTHON_ENV
             "SHIBADB_LIBRARY=$<TARGET_FILE:shibadb_shared>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
+        set(SDB_SANITIZER_ENV "")
+        # The python_* tests dlopen the instrumented shared library from a
+        # stock interpreter. Preload sanitizer runtimes so their handlers are
+        # available at load time and the binding stays instrumented.
+        if((SDB_ENABLE_SANITIZERS OR SDB_ENABLE_THREAD_SANITIZER)
+           AND NOT MSVC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            if(SDB_ENABLE_THREAD_SANITIZER)
+                set(sdb_rt_names libtsan.so)
+            else()
+                set(sdb_rt_names libasan.so libubsan.so)
+            endif()
+            set(sdb_sanitizer_rts)
+            set(sdb_missing_sanitizer_rts)
+            foreach(sdb_rt_name IN LISTS sdb_rt_names)
+                set(sdb_sanitizer_rt "")
+                execute_process(
+                    COMMAND ${CMAKE_C_COMPILER}
+                        -print-file-name=${sdb_rt_name}
+                    OUTPUT_VARIABLE sdb_sanitizer_rt
+                    ERROR_QUIET
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                )
+                if((NOT sdb_sanitizer_rt
+                    OR NOT EXISTS "${sdb_sanitizer_rt}")
+                   AND sdb_rt_name STREQUAL "libubsan.so"
+                   AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+                    execute_process(
+                        COMMAND ${CMAKE_C_COMPILER} --print-runtime-dir
+                        OUTPUT_VARIABLE sdb_sanitizer_rt_dir
+                        ERROR_QUIET
+                        OUTPUT_STRIP_TRAILING_WHITESPACE
+                    )
+                    if(sdb_sanitizer_rt_dir)
+                        set(sdb_ubsan_pattern
+                            "${sdb_sanitizer_rt_dir}/libclang_rt.ubsan_"
+                        )
+                        string(APPEND sdb_ubsan_pattern "standalone-*.so")
+                        file(GLOB sdb_ubsan_runtimes "${sdb_ubsan_pattern}")
+                        if(sdb_ubsan_runtimes)
+                            list(GET sdb_ubsan_runtimes 0 sdb_sanitizer_rt)
+                        endif()
+                    endif()
+                endif()
+                if(sdb_sanitizer_rt AND EXISTS "${sdb_sanitizer_rt}")
+                    list(APPEND sdb_sanitizer_rts "${sdb_sanitizer_rt}")
+                else()
+                    list(APPEND sdb_missing_sanitizer_rts "${sdb_rt_name}")
+                endif()
+            endforeach()
+            if(sdb_missing_sanitizer_rts)
+                string(JOIN ", " sdb_missing_sanitizer_names
+                    ${sdb_missing_sanitizer_rts}
+                )
+                message(WARNING
+                    "ShibaDB: sanitizer runtimes not found: "
+                    "${sdb_missing_sanitizer_names}; Python tests may fail "
+                    "to load the instrumented library"
+                )
+            endif()
+            if(sdb_sanitizer_rts)
+                string(JOIN ":" sdb_sanitizer_preload
+                    ${sdb_sanitizer_rts}
+                )
+                set(SDB_SANITIZER_ENV
+                    "LD_PRELOAD=${sdb_sanitizer_preload}"
+                )
+                if(SDB_ENABLE_SANITIZERS)
+                    # CPython keeps shutdown allocations; disable only that
+                    # interpreter's leak sweep, not the C tests' LSan.
+                    list(APPEND SDB_SANITIZER_ENV
+                        "ASAN_OPTIONS=detect_leaks=0"
+                    )
+                endif()
+                message(STATUS
+                    "ShibaDB: python tests will LD_PRELOAD "
+                    "${sdb_sanitizer_preload}"
+                )
+            endif()
+        endif()
+        # Held separately from SDB_PYTHON_ENV because python_wheel must NOT
+        # inherit PYTHONPATH -- the whole point of that test is to exercise the
+        # wheel installed into a throwaway venv, and an in-tree fallback would
+        # make it pass while shipping a broken package. It does still need the
+        # sanitizer half, so that is applied on its own below.
+        if(SDB_SANITIZER_ENV)
+            list(APPEND SDB_PYTHON_ENV ${SDB_SANITIZER_ENV})
+        endif()
         # cli.py / legacy_fixture.py drive main() directly rather than exposing
         # test_* functions, so they run as plain scripts, not under pytest.
         foreach(script cli legacy_fixture)
@@ -754,6 +934,76 @@ if(SDB_BUILD_TESTS)
             LABELS packaging
             RUN_SERIAL TRUE
         )
+        if(SDB_SANITIZER_ENV)
+            set_tests_properties(python_wheel PROPERTIES
+                ENVIRONMENT "${SDB_SANITIZER_ENV}"
+            )
+        endif()
+
+        # Release gates that live in scripts/ but were never registered as
+        # tests, so RELEASE.md listed "deterministic source archives" and
+        # "clean dependency/symbol audit" as satisfied while nothing in CI
+        # actually ran either. The source archive check is platform independent;
+        # release_audit.py inspects ELF runtime dependencies and is Linux-only.
+        #
+        # check_reproducible.py packages the source tree twice with a pinned
+        # epoch and compares the artifacts byte for byte.
+        add_test(
+            NAME release_reproducible
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_reproducible.py
+        )
+        set_tests_properties(release_reproducible PROPERTIES
+            LABELS packaging
+            RUN_SERIAL TRUE
+        )
+
+        # Non-strict release_audit.py checks dependencies and ELF runtime
+        # libraries for a distributable Linux build. Strict mode additionally
+        # requires commit-bound native/soak evidence plus gh attestation
+        # verification, which only exists inside the release workflow -- see
+        # docs/RELEASE_EVIDENCE.md.
+        #
+        # The DT_NEEDED check describes a production-shaped ELF artifact.
+        # Sanitizer builds add their runtimes, and PE/Mach-O binaries do not
+        # have ELF dependencies. Skip the audit for those build shapes instead
+        # of reporting the truth about the wrong artifact.
+        if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            message(STATUS
+                "ShibaDB: release_audit test skipped -- Linux ELF only"
+            )
+        elseif(SDB_ENABLE_SANITIZERS OR SDB_ENABLE_THREAD_SANITIZER
+               OR SDB_ENABLE_FUZZERS)
+            message(STATUS
+                "ShibaDB: release_audit test skipped -- this is an "
+                "instrumented build, whose runtime dependencies are not the "
+                "distributable binary's"
+            )
+        else()
+            find_program(SDB_NM nm llvm-nm)
+            find_program(SDB_READELF readelf llvm-readelf greadelf)
+            if(SDB_NM AND SDB_READELF)
+                add_test(
+                    NAME release_audit
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/release_audit.py
+                        --library $<TARGET_FILE:shibadb_shared>
+                        --nm ${SDB_NM}
+                        --readelf ${SDB_READELF}
+                        --json-output
+                            ${CMAKE_CURRENT_BINARY_DIR}/release-audit.json
+                )
+                set_tests_properties(release_audit PROPERTIES
+                    LABELS packaging
+                    RUN_SERIAL TRUE
+                )
+            else()
+                message(STATUS
+                    "ShibaDB: release_audit test skipped (needs nm + readelf; "
+                    "found nm='${SDB_NM}' readelf='${SDB_READELF}')"
+                )
+            endif()
+        endif()
     endif()
 
     # Drive the native CLI end to end (argument parsing, exit codes, KV round

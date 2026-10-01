@@ -17,21 +17,38 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build build --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 300
+        id: test
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --test-dir build --output-on-failure --timeout 300
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   mingw-cross-build:
     name: Windows cross-build (MinGW)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install MinGW
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - name: Configure
@@ -45,16 +62,78 @@ jobs:
     env:
       CC: clang
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
       - name: Configure
         run: cmake --preset sanitize
       - name: Build
-        run: cmake --build --preset sanitize --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build --preset sanitize --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
+        id: test
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --preset sanitize --output-on-failure
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --preset sanitize --output-on-failure
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
+
+  # Same sanitizer gate, GCC instead of Clang. Not redundant: the two runtimes
+  # link differently, and the difference was load-bearing. GCC links libasan
+  # statically into the shared library, so a stock CPython interpreter that
+  # dlopens it aborts with "ASan runtime does not come first in initial library
+  # list" -- all four python_* tests failed under the sanitize preset on GCC for
+  # a reason invisible to the Clang job, which uses the dynamic runtime. CMake
+  # now preloads the runtime for those tests (see the SDB_SANITIZER_ENV block in
+  # CMakeLists.txt), and this job is what keeps that fix from rotting.
+  sanitizers-gcc:
+    name: Sanitizers (ASan+UBSan, GCC)
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+    steps:
+      - uses: actions/checkout@v6
+      # setup-python before pip: the runner's system python3 is a PEP 668
+      # externally-managed environment, so a bare `python3 -m pip install`
+      # refuses. native-portability already does it this way.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
+      - name: Configure
+        run: cmake --preset sanitize-gcc
+      - name: Build
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build --preset sanitize-gcc --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
+      - name: Test
+        id: test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --preset sanitize-gcc --output-on-failure --timeout 900
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   thread-sanitizer:
     name: ThreadSanitizer
@@ -62,15 +141,32 @@ jobs:
     env:
       CC: clang
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
       - name: Configure
         run: cmake --preset tsan
       - name: Build
-        run: cmake --build --preset tsan --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build --preset tsan --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
+        id: test
         env:
           TSAN_OPTIONS: halt_on_error=1
-        run: ctest --test-dir build-tsan --output-on-failure --timeout 600
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --test-dir build-tsan --output-on-failure --timeout 600
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   fuzz-smoke:
     name: Fuzz smoke (replay + short fuzz)
@@ -78,7 +174,7 @@ jobs:
     env:
       CC: clang
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Configure
         run: cmake --preset fuzz
       - name: Build
@@ -119,7 +215,7 @@ jobs:
           - os: windows-latest
             platform: Windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # The binding came back in c7a9aa8, so the suite is no longer pure C: the
       # python_* tests need an interpreter with pytest, and CMake skips
       # registering them when Python3 is absent — which is how they went
@@ -128,7 +224,7 @@ jobs:
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
       - name: Install pytest
@@ -136,6 +232,44 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --parallel
+        id: build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py run build -- \
+              cmake --build build --parallel
+          else
+            python3 .github/scripts/ci_log.py run build -- \
+              cmake --build build --parallel
+          fi
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py report build
+          else
+            python3 .github/scripts/ci_log.py report build
+          fi
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 1800 --no-tests=error
+        id: test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py run test -- ctest \
+              --test-dir build --output-on-failure --timeout 1800 \
+              --no-tests=error
+          else
+            python3 .github/scripts/ci_log.py run test -- ctest \
+              --test-dir build --output-on-failure --timeout 1800 \
+              --no-tests=error
+          fi
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py report test
+          else
+            python3 .github/scripts/ci_log.py report test
+          fi

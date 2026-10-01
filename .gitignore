@@ -38,3 +38,11 @@ mempalace.yaml
 *.tmp.wal
 *.tmp.lock
 *.tmp.tmp-*
+
+# AI-assistant session transcripts / scratch logs. These carry local absolute
+# paths, account names, model identifiers and full internal reasoning; they are
+# development context, not project artifacts, and must never be published.
+SESSION-*.jsonl
+*.jsonl
+.xtalk-session*
+session-*.log

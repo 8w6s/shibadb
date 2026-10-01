@@ -2,6 +2,76 @@
 
 _Snapshot: 2026-07-28 sau Phase 0 clean slate._
 
+> **Read this first: the tables below are a Phase 0 baseline, not current
+> state.** The suite, the LOC and the throughput figures have all moved
+> substantially since 2026-07-28. Current measurements are in the next section;
+> everything after it is retained as the historical record it is labelled to be.
+
+## Current state — 2026-10-01
+
+Measured on Linux, GCC 12.2, 2 cores, `CMAKE_BUILD_TYPE=Release`.
+
+| Metric | Value |
+|---|---:|
+| Production LOC (`src/` + `include/` + `cli/`) | **19 450** |
+| Test LOC (`tests/`) | **15 624** |
+| Test / production ratio | **80 %** |
+| Registered CTest cases | **71** |
+| Test files | 69 |
+| Public ABI symbols | 72 |
+
+Methodology — reproduce before changing any number above:
+
+```sh
+# LOC: comment-and-blank-stripped with the repo's own stripper
+python3 - <<'PY'
+import glob, sys
+sys.path.insert(0, 'scripts')
+from strip_c_comments import strip
+def loc(paths):
+    return sum(len([l for l in strip(open(p, encoding='utf-8').read()).split('\n')
+                    if l.strip()]) for p in paths)
+prod = glob.glob('src/*.c') + glob.glob('src/*.h') + glob.glob('include/*.h') \
+     + glob.glob('cli/*.c')
+test = glob.glob('tests/*.c') + glob.glob('tests/*.py') + glob.glob('tests/*.cmake')
+print('production', loc(prod), 'tests', loc(test))
+PY
+
+ctest --test-dir build -N | tail -1        # registered test count
+nm -D --defined-only build/libshibadb.so.1.0.0 | grep -c ' sdb_'   # ABI surface
+```
+
+Build and durability status at this commit:
+
+- Clean build with `-Wall -Wextra -Wpedantic -Wconversion -Wshadow
+  -Wstrict-prototypes -Wmissing-prototypes -Werror`: **0 warnings**.
+- Release: **71/71 PASS**.
+- GCC ASan+UBSan: **70/70 PASS** (`release_audit` is intentionally not
+  registered for instrumented builds — see [COVERAGE.md](COVERAGE.md)).
+- cppcheck 2.17 (`--enable=warning,style,performance,portability`) over `src`,
+  `cli`, `examples`, `benchmarks`: **0 errors, 0 warnings**.
+
+Throughput, encrypted, 100-byte values, `bench_kv` on this 2-core box:
+
+| Op | Measured 2026-10-01 | Phase 0 baseline below |
+|---|---:|---:|
+| put (auto-commit) | **1 170 ops/s** | 59 ops/s |
+| get (auto-commit) | **30 829 ops/s** | 2 432 ops/s |
+| delete (auto-commit) | **1 472 ops/s** | 76 ops/s |
+| put (batched 1000/txn) | **16 774 ops/s** | 8 608 ops/s |
+
+The ~20× auto-commit improvement is the persistent-WAL-fd and leader/follower
+group-commit work described under "Optimization status" below. Those sections
+note that the baseline numbers no longer reflect the engine but never published
+the replacement figures; this table is that replacement. Hardware differs
+between the two runs, so treat the ratio as indicative rather than exact.
+
+Crypto micro-benchmarks (`bench_crypto`, same box, SHA-NI + AVX2 present):
+SHA-256 1105 MB/s, CRC-32 2198 MB/s, XChaCha20-Poly1305 667 MB/s, and
+PBKDF2-HMAC-SHA256 at the 600 000-iteration default costs **245 ms per
+encrypted-database open** — the figure to quote when someone asks why opening an
+encrypted database is not instant.
+
 ## Health signals
 
 | Metric | Baseline | Target 1.0 | Hvpdb red line |

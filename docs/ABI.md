@@ -28,13 +28,33 @@ can retain ABI v1 while adding an explicitly migrated file format.
 ## Exported surface
 
 Shared builds use hidden visibility by default. The authoritative ABI v1
-allowlist is [`abi/symbols-v1.txt`](../abi/symbols-v1.txt). Internal pager,
-WAL, crypto, allocator, synchronization, and fault-injection symbols are not
-exported.
+allowlist is [`abi/symbols-v1.txt`](../abi/symbols-v1.txt) — 72 symbols.
+Internal pager, WAL, crypto, allocator, synchronization, and fault-injection
+symbols are not exported.
 
-The ABI test freezes public structure layouts and runtime version functions.
-The symbol test compares the actual dynamic symbol table byte-for-byte with
-the allowlist.
+Two CTest cases enforce this, and they cover different halves:
+
+- `abi` (`tests/test_abi.c`) freezes public structure layouts, sizes and field
+  offsets at compile time via `_Static_assert`, plus the runtime version
+  functions. It is a *compile-time* gate: it cannot see the symbol table.
+- `abi_symbols` (`tests/check_symbols.cmake`) compares the shared library's
+  exported symbol set against the allowlist, exactly and in **both**
+  directions. A symbol exported but missing from the allowlist fails the build
+  (unreviewed ABI growth); an allowlisted symbol that stopped being exported
+  fails it too (ABI break).
+
+Comparison normalises away platform noise so one allowlist serves every target:
+the Mach-O leading underscore is stripped, and only *defined external* symbols
+matching `^sdb_` are considered, which excludes synthesised runtime symbols
+(`_init`, `_fini`, `__bss_start`, `__mh_execute_header`) and keeps the gate
+correct even when it has to fall back to a plain `nm` that also lists hidden
+local functions. The dumper is resolved in the order `llvm-nm`, `nm`, `dumpbin`
+so Linux, macOS and MSVC need no per-platform wiring; pass `-DNM=` to override
+for a cross-build.
+
+Adding a public entry point therefore takes two edits, not one: declare it with
+`SDB_API` and add the name to `abi/symbols-v1.txt`. Forgetting the second is
+now a build failure rather than a silent widening of the ABI.
 
 ## CMake installation
 

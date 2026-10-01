@@ -4,9 +4,11 @@
  * A thin, portable front-end over the public engine API (shibadb_engine.h).
  * It links the same library an application would and performs no I/O of its
  * own beyond argv/stdin/stdout, so its behaviour is exactly what an embedder
- * sees. Values supplied on the command line are treated as raw bytes; values
- * printed to stdout are written verbatim (binary-safe) with no added newline
- * unless noted.
+ * sees. Values supplied on the command line are treated as raw bytes; `get`
+ * writes the stored bytes to stdout verbatim (binary-safe) and adds a trailing
+ * newline only when stdout is a terminal, so redirected/piped output
+ * round-trips exactly. Line-oriented commands (`scan`, `namespaces`, `find`)
+ * always terminate their rows.
  *
  * Password handling: prefer the SHIBADB_PASSWORD environment variable over
  * --password, which is visible in the process list on most systems. A
@@ -23,6 +25,41 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <io.h>     /* _isatty, _fileno */
+#else
+#include <unistd.h> /* isatty, fileno */
+#endif
+
+/* ------------------------------------------------------------------ */
+/* Output helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * True when stdout is a terminal.
+ *
+ * Values are stored as arbitrary bytes, so `get` writes them verbatim: a
+ * piped or redirected stream must stay byte-exact or `shibadb get db ns k
+ * > value.bin` would not round-trip. A bare value with no line terminator is
+ * unpleasant interactively, though -- the next shell prompt lands on the same
+ * line and two gets in a row run together. Add the newline only for a human
+ * at a TTY; scripts and pipes see the exact bytes they stored.
+ */
+static bool stdout_is_tty(void)
+{
+#ifdef _WIN32
+    return _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(fileno(stdout)) != 0;
+#endif
+}
+
+/* "1 entry" / "2 entries" for the single-count summary lines. */
+static const char *entries_word(uint64_t count)
+{
+    return count == UINT64_C(1) ? "entry" : "entries";
+}
 
 /* ------------------------------------------------------------------ */
 /* Shared option parsing                                              */
@@ -345,6 +382,10 @@ static int cmd_get(const char *path, const char *ns, const char *key,
                           (const uint8_t *)key, strlen(key), &buf, &got);
     if (st == SDB_OK && got > 0) {
         fwrite(buf, 1, got, stdout);
+        /* Interactive only: see stdout_is_tty(). Piped output stays exact. */
+        if (stdout_is_tty() && buf[got - 1] != '\n') {
+            fputc('\n', stdout);
+        }
     }
     sdb_free(buf);
     sdb_status close_st = sdb_database_close(db);
@@ -421,7 +462,8 @@ static int cmd_scan(const char *path, const char *ns, const cli_options *opts) {
     if (close_st != SDB_OK) {
         return fail("scan (close)", close_st);
     }
-    fprintf(stderr, "shibadb: %" PRIu64 " entries\n", ctx.seen);
+    fprintf(stderr, "shibadb: %" PRIu64 " %s\n", ctx.seen,
+            entries_word(ctx.seen));
     return 0;
 }
 
@@ -774,8 +816,9 @@ static int cmd_backup(const char *path, const char *dest,
     if (close_st != SDB_OK) {
         return fail("backup (close)", close_st);
     }
-    printf("backup: %s -> %s (%" PRIu64 " bytes, %" PRIu64 " entries)\n",
-           path, dest, r.byte_count, r.raw_entry_count);
+    printf("backup: %s -> %s (%" PRIu64 " bytes, %" PRIu64 " %s)\n",
+           path, dest, r.byte_count, r.raw_entry_count,
+           entries_word(r.raw_entry_count));
     return 0;
 }
 

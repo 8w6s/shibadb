@@ -1,52 +1,106 @@
+# Authoritative public symbol surface of libshibadb (ABI v1).
+#
+# Enforced by the `abi_symbols` CTest, which compares this list against the
+# dynamic symbol table of the shared library in BOTH directions: a symbol
+# exported but absent here fails the build (unreviewed ABI growth), and a
+# symbol listed here but no longer exported fails the build (ABI break).
+# See docs/ABI.md for the compatibility policy.
+#
+# Rules:
+#   - one symbol per line, sorted, no leading underscore (the gate strips the
+#     Mach-O '_' prefix before comparing);
+#   - '#' starts a comment, blank lines are ignored;
+#   - additions must be append-only and backward compatible within ABI v1;
+#     removals or signature changes require ABI v2 and a new SOVERSION.
+#
+# Groups are commented for reviewability; the gate reads the union as one set.
+
+# Version / status
 sdb_abi_version
-sdb_blob_delete
-sdb_blob_get
-sdb_blob_put
-sdb_database_backup
-sdb_database_close
-sdb_database_compact
-sdb_database_create
-sdb_database_info
-sdb_database_migrate
-sdb_database_open
-sdb_database_options_init
-sdb_database_verify
-sdb_document_delete
-sdb_document_get
-sdb_document_put
-sdb_free
-sdb_index_create
-sdb_index_query_documents
-sdb_index_visit
-sdb_kv_batch_apply
-sdb_kv_compare_and_swap
-sdb_kv_count
-sdb_kv_count_prefix
-sdb_kv_delete
-sdb_kv_exists
-sdb_kv_get
-sdb_kv_get_alloc
-sdb_kv_increment
-sdb_kv_put
-sdb_kv_put_if_absent
 sdb_status_string
+sdb_version_number
+sdb_version_string
+sdb_free
+
+# Database lifecycle
+sdb_database_create
+sdb_database_open
+sdb_database_close
+sdb_database_info
+sdb_database_options_init
+
+# Operational tooling
+sdb_database_backup
+sdb_database_compact
+sdb_database_verify
+sdb_database_migrate
+sdb_database_migrate_file
+
+# On-disk superblock codec (public for tooling and forensics)
 sdb_superblock_store_create
 sdb_superblock_store_read
 sdb_superblock_store_update
 sdb_superblock_v1_decode
 sdb_superblock_v1_encode
+
+# Key/value, auto-commit
+sdb_kv_put
+sdb_kv_get
+sdb_kv_get_alloc
+sdb_kv_delete
+sdb_kv_exists
+sdb_kv_count
+sdb_kv_count_prefix
+sdb_kv_put_if_absent
+sdb_kv_compare_and_swap
+sdb_kv_increment
+sdb_kv_batch_apply
+
+# Scan / cursor / snapshot (append-only slice; see docs/CURSORS.md)
+sdb_cursor_close
+sdb_cursor_first
+sdb_cursor_get
+sdb_cursor_key
+sdb_cursor_next
+sdb_cursor_open
+sdb_cursor_options_init
+sdb_cursor_read
+sdb_cursor_seek
+sdb_cursor_status
+sdb_cursor_valid
+sdb_cursor_value
+sdb_kv_scan_prefix
+sdb_list_namespaces
+sdb_scan_options_init
+sdb_snapshot_close
+sdb_snapshot_open
+sdb_snapshot_version
+
+# Documents and secondary indexes
+sdb_document_put
+sdb_document_get
+sdb_document_delete
+sdb_index_create
+sdb_index_visit
+sdb_index_query_documents
+
+# Blobs
+sdb_blob_put
+sdb_blob_get
+sdb_blob_delete
+
+# Explicit multi-operation transactions
 sdb_transaction_begin
-sdb_transaction_blob_delete
-sdb_transaction_blob_get
-sdb_transaction_blob_put
-sdb_transaction_close
 sdb_transaction_commit
-sdb_transaction_document_delete
-sdb_transaction_document_get
-sdb_transaction_document_put
-sdb_transaction_index_create
-sdb_transaction_kv_delete
-sdb_transaction_kv_get
-sdb_transaction_kv_put
 sdb_transaction_rollback
-sdb_version_string
+sdb_transaction_close
+sdb_transaction_kv_put
+sdb_transaction_kv_get
+sdb_transaction_kv_delete
+sdb_transaction_blob_put
+sdb_transaction_blob_get
+sdb_transaction_blob_delete
+sdb_transaction_document_put
+sdb_transaction_document_get
+sdb_transaction_document_delete
+sdb_transaction_index_create

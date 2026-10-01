@@ -56,6 +56,13 @@
       }
     },
     {
+      "name": "sanitize-gcc",
+      "inherits": "gcc",
+      "cacheVariables": {
+        "SDB_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
       "name": "tsan",
       "inherits": "clang",
       "cacheVariables": {
@@ -102,6 +109,7 @@
     {"name": "mingw", "configurePreset": "mingw"},
     {"name": "release", "configurePreset": "release"},
     {"name": "sanitize", "configurePreset": "sanitize"},
+    {"name": "sanitize-gcc", "configurePreset": "sanitize-gcc"},
     {"name": "tsan", "configurePreset": "tsan"},
     {"name": "soak", "configurePreset": "soak"},
     {"name": "bench", "configurePreset": "bench"},
@@ -122,6 +130,11 @@
     {
       "name": "sanitize",
       "configurePreset": "sanitize",
+      "output": {"outputOnFailure": true}
+    },
+    {
+      "name": "sanitize-gcc",
+      "configurePreset": "sanitize-gcc",
       "output": {"outputOnFailure": true}
     },
     {

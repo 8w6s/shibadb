@@ -140,18 +140,29 @@ int main(void)
         && strcmp(getenv("SDB_BENCH_PLAINTEXT"), "0") != 0;
     sdb_database_options options;
     sdb_database *database = NULL;
-    uint8_t *value;
-    uint8_t *readback;
-    worker_ctx *ctx;
+    /*
+     * Every allocation starts NULL and every error path funnels through the
+     * `fail` cleanup below. The earlier version returned 1 straight out of
+     * main on nine different paths, leaking value/readback/ctx and the thread
+     * array each time (cppcheck: memleak at the OOM return). The OS reclaims it
+     * anyway for a short-lived benchmark, but an error path that leaks is an
+     * error path whose leak report is indistinguishable from a real one -- and
+     * this harness is also used under ASan, where the noise matters.
+     */
+    uint8_t *value = NULL;
+    uint8_t *readback = NULL;
+    worker_ctx *ctx = NULL;
     uint64_t start;
     uint64_t end;
     uint64_t total_ops;
     uint32_t w;
+    uint32_t spawned = 0U;
+    int rc = 1;   /* set to 0 only on the fully verified success path */
     sdb_status status;
 #ifdef _WIN32
-    HANDLE *hthreads;
+    HANDLE *hthreads = NULL;
 #else
-    pthread_t *pthreads;
+    pthread_t *pthreads = NULL;
 #endif
 
     value = (uint8_t *)malloc(value_size == 0U ? 1U : value_size);
@@ -165,7 +176,7 @@ int main(void)
     if (value == NULL || readback == NULL || ctx == NULL || pthreads == NULL) {
 #endif
         (void)fprintf(stderr, "bench: out of memory\n");
-        return 1;
+        goto cleanup;
     }
     (void)memset(value, 0xA5, value_size);
 
@@ -179,7 +190,7 @@ int main(void)
     status = sdb_database_create(bench_path, &options, &database);
     if (status != SDB_OK) {
         (void)fprintf(stderr, "create failed: %s\n", sdb_status_string(status));
-        return 1;
+        goto cleanup;
     }
 
     total_ops = (uint64_t)threads * (uint64_t)ops_per;
@@ -206,14 +217,15 @@ int main(void)
         hthreads[w] = CreateThread(NULL, 0U, worker_entry, &ctx[w], 0U, NULL);
         if (hthreads[w] == NULL) {
             (void)fprintf(stderr, "CreateThread failed\n");
-            return 1;
+            goto fail_spawned;
         }
 #else
         if (pthread_create(&pthreads[w], NULL, worker_entry, &ctx[w]) != 0) {
             (void)fprintf(stderr, "pthread_create failed\n");
-            return 1;
+            goto fail_spawned;
         }
 #endif
+        spawned = (uint32_t)(w + 1U);
     }
     for (w = 0U; w < threads; ++w) {
 #ifdef _WIN32
@@ -223,6 +235,7 @@ int main(void)
         (void)pthread_join(pthreads[w], NULL);
 #endif
     }
+    spawned = 0U;   /* all reaped: later error paths have no threads to join */
     end = bench_now_ns();
 
     for (w = 0U; w < threads; ++w) {
@@ -231,7 +244,7 @@ int main(void)
                 stderr, "worker %u failed: %s\n", w,
                 sdb_status_string(ctx[w].fail_status)
             );
-            return 1;
+            goto cleanup;
         }
     }
 
@@ -253,13 +266,13 @@ int main(void)
     status = sdb_database_close(database);
     if (status != SDB_OK) {
         (void)fprintf(stderr, "close failed: %s\n", sdb_status_string(status));
-        return 1;
+        goto cleanup;
     }
     database = NULL;
     status = sdb_database_open(bench_path, &options, &database);
     if (status != SDB_OK) {
         (void)fprintf(stderr, "reopen failed: %s\n", sdb_status_string(status));
-        return 1;
+        goto cleanup;
     }
     for (w = 0U; w < threads; ++w) {
         uint32_t op;
@@ -278,7 +291,7 @@ int main(void)
                     "VERIFY FAILED worker=%u op=%u status=%s got=%zu\n",
                     w, op, sdb_status_string(status), got
                 );
-                return 1;
+                goto cleanup;
             }
         }
     }
@@ -288,7 +301,31 @@ int main(void)
     status = sdb_database_close(database);
     if (status != SDB_OK) {
         (void)fprintf(stderr, "final close failed: %s\n", sdb_status_string(status));
-        return 1;
+        goto cleanup;
+    }
+    database = NULL;   /* closed: cleanup must not close the freed handle */
+    rc = 0;
+    goto cleanup;
+
+fail_spawned:
+    /*
+     * A worker did not start, but the ones before it are running and each holds
+     * a pointer to its own ctx[w]. Reap them before the array is released --
+     * freeing ctx while a live thread reads it is a use-after-free, which would
+     * be a strictly worse defect than the leak this cleanup path exists to fix.
+     * This label then falls through to the shared cleanup below.
+     */
+    for (w = 0U; w < spawned; ++w) {
+#ifdef _WIN32
+        (void)WaitForSingleObject(hthreads[w], INFINITE);
+        (void)CloseHandle(hthreads[w]);
+#else
+        (void)pthread_join(pthreads[w], NULL);
+#endif
+    }
+cleanup:
+    if (database != NULL) {
+        (void)sdb_database_close(database);
     }
     free(value);
     free(readback);
@@ -299,5 +336,5 @@ int main(void)
     free(pthreads);
 #endif
     bench_cleanup();
-    return 0;
+    return rc;
 }

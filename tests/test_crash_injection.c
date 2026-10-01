@@ -22,9 +22,11 @@
  * Scope: SIGKILL models an application crash. Data already fsync'd is on disk,
  * so this proves the recovery/WAL-replay path is correct and leaves no
  * corruption, and that acknowledged (fsync'd) commits survive. It does NOT by
- * itself simulate power-loss of not-yet-fsync'd writes (that needs a
- * fault-injecting block device such as dm-flakey); that remains a separate
- * gap.
+ * itself simulate power-loss of not-yet-fsync'd writes, which needs a
+ * fault-injecting block device: that case is covered separately by
+ * tests/powerloss_test.sh (dm-flakey). The two are complementary, not
+ * redundant -- this one runs in CTest on every build, that one needs root, a
+ * loop device and device-mapper, so it is a manual gate outside CTest.
  */
 #include "shibadb_engine.h"
 

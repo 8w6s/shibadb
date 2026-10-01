@@ -1,10 +1,19 @@
 # Coverage snapshot
 
 > **Historical snapshot.** These figures come from the 2026-07-28 (Phase 0)
-> `coverage`-preset runs at 41/43 tests. The suite has since grown to 47
-> tests (adding group-commit, crash-injection, power-loss, and Python-binding
-> coverage); re-run the `coverage` preset (see "How to reproduce this report")
-> for current numbers.
+> `coverage`-preset runs at 41/43 tests. The suite has since grown to **71
+> registered CTest cases** (adding group-commit, crash-injection, Python-binding,
+> ABI-symbol and release-audit coverage), so every percentage below understates
+> the current state; re-run the `coverage` preset (see "How to reproduce this
+> report") for current numbers.
+>
+> Note that the two tests this report lists under "Known preset-artifact
+> failures" — `abi_symbols` and `release_audit` — had since disappeared from the
+> build entirely rather than being fixed, and were re-wired in `CMakeLists.txt`.
+> `abi_symbols` now runs on every configuration. `release_audit` is registered
+> only for production-shaped builds, because its `DT_NEEDED == libc` check
+> asserts a property of a distributable binary that an ASan/UBSan/TSan build
+> legitimately violates.
 
 _Last updated: 2026-07-28 (Phase 0 cleanup)_
 
