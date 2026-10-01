@@ -23,9 +23,21 @@ jobs:
           CC: ${{ matrix.cc }}
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build build --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 300
+        id: test
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --test-dir build --output-on-failure --timeout 300
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   mingw-cross-build:
     name: Windows cross-build (MinGW)
@@ -49,12 +61,24 @@ jobs:
       - name: Configure
         run: cmake --preset sanitize
       - name: Build
-        run: cmake --build --preset sanitize --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build --preset sanitize --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
+        id: test
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --preset sanitize --output-on-failure
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --preset sanitize --output-on-failure
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   # Same sanitizer gate, GCC instead of Clang. Not redundant: the two runtimes
   # link differently, and the difference was load-bearing. GCC links libasan
@@ -82,12 +106,24 @@ jobs:
       - name: Configure
         run: cmake --preset sanitize-gcc
       - name: Build
-        run: cmake --build --preset sanitize-gcc --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build --preset sanitize-gcc --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
+        id: test
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --preset sanitize-gcc --output-on-failure --timeout 900
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --preset sanitize-gcc --output-on-failure --timeout 900
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   thread-sanitizer:
     name: ThreadSanitizer
@@ -99,11 +135,23 @@ jobs:
       - name: Configure
         run: cmake --preset tsan
       - name: Build
-        run: cmake --build --preset tsan --parallel
+        id: build
+        run: >-
+          python3 .github/scripts/ci_log.py run build --
+          cmake --build --preset tsan --parallel
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
       - name: Test
+        id: test
         env:
           TSAN_OPTIONS: halt_on_error=1
-        run: ctest --test-dir build-tsan --output-on-failure --timeout 600
+        run: >-
+          python3 .github/scripts/ci_log.py run test -- ctest
+          --test-dir build-tsan --output-on-failure --timeout 600
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report test
 
   fuzz-smoke:
     name: Fuzz smoke (replay + short fuzz)
@@ -169,6 +217,44 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --parallel
+        id: build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py run build -- \
+              cmake --build build --parallel
+          else
+            python3 .github/scripts/ci_log.py run build -- \
+              cmake --build build --parallel
+          fi
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py report build
+          else
+            python3 .github/scripts/ci_log.py report build
+          fi
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 1800 --no-tests=error
+        id: test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py run test -- ctest \
+              --test-dir build --output-on-failure --timeout 1800 \
+              --no-tests=error
+          else
+            python3 .github/scripts/ci_log.py run test -- ctest \
+              --test-dir build --output-on-failure --timeout 1800 \
+              --no-tests=error
+          fi
+      - name: Annotate test failure
+        if: failure() && steps.test.outcome == 'failure'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python .github/scripts/ci_log.py report test
+          else
+            python3 .github/scripts/ci_log.py report test
+          fi

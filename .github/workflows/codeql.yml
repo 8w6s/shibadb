@@ -32,9 +32,14 @@ jobs:
           queries: security-and-quality
 
       - name: Build
+        id: build
         run: |
           cmake --preset clang
-          cmake --build build-clang -j
+          python3 .github/scripts/ci_log.py run build -- \
+            cmake --build build-clang -j
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 .github/scripts/ci_log.py report build
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
