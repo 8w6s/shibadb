@@ -11,6 +11,20 @@ Performance and durability hardening on top of the `v1.0.0-rc*` line. The
 C ABI and on-disk format remain frozen at v1.0.
 
 ### Performance
+- **`sdb_secure_zero` uses the platform's non-elidable zeroisation primitive.**
+  It was a `volatile` byte-at-a-time loop, which is correct but blocks
+  vectorisation, and it runs once per encrypted page encode *and* decode.
+  Measured over a 4 KiB buffer: ~1616 ns (2.5 GB/s) for the byte loop against
+  ~29 ns (~140 GB/s) for `explicit_bzero` — while AEAD decryption of the same
+  page is only ~6 µs, so the scrub was spending roughly a quarter of the
+  per-page decrypt budget. Selection is by configure-time `check_symbol_exists`
+  rather than platform macros, because `explicit_bzero`'s visibility depends on
+  the feature-macro combination: `C_EXTENSIONS OFF` plus `_POSIX_C_SOURCE`
+  suppresses glibc's implicit `_DEFAULT_SOURCE`, and musl gates it on
+  `_BSD_SOURCE` the same way. `_DEFAULT_SOURCE` is now defined, and the order is
+  `SecureZeroMemory` → `explicit_bzero` → `memset_s` → the original volatile
+  loop, so an undetected platform keeps today's behaviour instead of failing to
+  build.
 - **Opt-in relaxed durability (`SDB_SYNCHRONOUS_NORMAL`).** A new `synchronous`
   field on `sdb_database_options` (default `SDB_SYNCHRONOUS_FULL`, unchanged
   behaviour) lets auto-commits acknowledge after the WAL pwrite but before the
@@ -37,6 +51,53 @@ C ABI and on-disk format remain frozen at v1.0.
 - **Hash-indexed, byte-configurable page cache.** Commit `47fb8cf`.
 
 ### Fixed
+- **`shibadb get` emitted no line terminator.** `docget` and `scan` both
+  terminate their output; `get` did not, so two gets into one redirected stream
+  ran together. Values are arbitrary bytes, so an unconditional newline would
+  break `shibadb get db ns k > value.bin` round-tripping — the newline is now
+  added only when stdout is a terminal, and suppressed when the value already
+  ends in one. Piped and redirected output stays byte-exact. Also fixed the
+  summary lines printing "1 entries".
+- **ABI symbol allowlist was stale by 20 symbols and enforced by nothing.**
+  `abi/symbols-v1.txt` listed 52 symbols while the shared library exported 72:
+  the whole cursor/scan/snapshot slice (12 `sdb_cursor_*`, `sdb_snapshot_open` /
+  `_close` / `_version`, `sdb_kv_scan_prefix`, `sdb_scan_options_init`,
+  `sdb_cursor_options_init`, `sdb_list_namespaces`) plus
+  `sdb_database_migrate_file` and `sdb_version_number`. `docs/ABI.md` claimed
+  "the symbol test compares the actual dynamic symbol table byte-for-byte with
+  the allowlist", but `tests/check_symbols.cmake` was referenced by nothing in
+  the build — a dead file, so the gate silently did not exist and CI stayed
+  green throughout. Rewritten to be portable (ELF / Mach-O / PE, resolving
+  `llvm-nm` → `nm` → `dumpbin`) and registered as the `abi_symbols` CTest; the
+  allowlist is now 72 symbols and matches.
+- **Two release-gate scripts were wired into nothing.** `RELEASE.md` lists
+  "deterministic source archives" and "clean dependency/symbol audit" as
+  satisfied, but neither `scripts/check_reproducible.py` nor
+  `scripts/release_audit.py` ran in CTest or CI — and `docs/AUDIT.md` and
+  `docs/COVERAGE.md` both still described `abi_symbols` and `release_audit` as
+  existing tests. Registered as `release_reproducible` and `release_audit`.
+  `release_audit` runs only for production-shaped builds: its
+  `DT_NEEDED == libc` check asserts a property of a distributable binary, and a
+  sanitizer build legitimately gains `libasan.so.N` / `libubsan.so.N`.
+- **`release_audit.py`'s dependency scan matched prose.** It scanned raw file
+  bytes, so a comment merely *mentioning* a third-party crypto library was
+  reported as a forbidden dependency. It now strips comments and docstrings
+  first, reusing the strippers the repo already ships, and falls back to raw
+  bytes when a file does not parse so a failure can never silently exempt a
+  file. Its allowlist parsing was also naive (`splitlines()`, no comment
+  handling) and disagreed with the CMake gate about what ABI v1 is; both
+  readers now normalise identically.
+- **`sdb_replace_recover` read a possibly-uninitialised `replacement_file_id`.**
+  Safe in practice — the `memcmp` is guarded by `status == SDB_OK &&`, so a
+  failed decode never reaches it — but only provably so by reconstructing the
+  decoder's contract. Now zero-initialised, which also clears the cppcheck
+  `uninitvar` finding.
+- **`bench_concurrent` leaked on every error path.** Nine `return 1` exits left
+  `value`, `readback`, `ctx` and the thread array allocated (cppcheck `memleak`
+  ×5). All paths now funnel through one cleanup block. The mid-spawn failure
+  path joins the workers that *did* start before releasing their `ctx` slots —
+  freeing the array under a live thread would be a use-after-free, a strictly
+  worse defect than the leak being fixed.
 - **Compaction stripped encryption.** Compact copied entries in a way that
   could drop the page encryption envelope; the target now preserves it.
 - **Python binding closed the handle on `SDB_E_BUSY`.** The binding no
@@ -72,13 +133,31 @@ C ABI and on-disk format remain frozen at v1.0.
   `python_cli`, `python_legacy_fixture`, `python_pytest` and `python_wheel`;
   `test_python_binding.py` itself was deleted in `522c876` and has not come
   back, so the wheel gate drives `test_cli.py` through the installed package
-  instead. The tree registers 67 ctest entries (the "53 tests" this entry used
-  to claim was already stale).
+  instead. The tree registers 71 ctest entries (the "53 tests" this entry used
+  to claim, and the 67 it was later corrected to, were both stale).
 - **Packaging gates are now part of CTest.** The external install-consumer and
   Python wheel scripts run as serial packaging tests. Enabling the gate exposed
   and fixed a stale `find_package(ShibaDB 0.1)` requirement after the package
   version moved to 1.0. The wheel script went dormant again with the removal
   above and is wired back up now.
+
+- **Python binding now survives the sanitizer preset.** Under GCC all four
+  `python_*` tests failed with "ASan runtime does not come first in initial
+  library list": GCC links `libasan` statically into `shibadb_shared`, and a
+  stock interpreter that dlopens it aborts at load. CMake now asks the compiler
+  where its runtime lives (`-print-file-name=libasan.so` / `libtsan.so`) and
+  preloads it for those tests, so the binding stays under sanitizer coverage
+  instead of being skipped. LeakSanitizer is disabled for the
+  interpreter-driven tests only — it was reporting CPython's own deliberate
+  shutdown allocations (`PyType_GenericAlloc`, `_PyCode_New`) as leaks. Leak
+  detection stays on for every C test, where this library's allocations live.
+- **New `sanitizers-gcc` CI job.** The Clang-only sanitizer job could not see
+  that failure, because Clang uses the dynamic ASan runtime for shared
+  libraries. New `sanitize-gcc` configure/build/test presets plus a CI job keep
+  the GCC path — and the preload fix — from rotting.
+- **`abi_symbols` gate proven non-vacuous.** Verified to fail in both
+  directions: removing an entry reports "unreviewed ABI growth", adding a
+  nonexistent one reports "ABI break".
 
 ### Portability
 - **Windows I/O and locking repaired.** Database identity exclusion now uses a

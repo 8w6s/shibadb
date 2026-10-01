@@ -1,8 +1,46 @@
 # ShibaDB-C Public Cursor, Scan, and Enumerate API
 
-**Status:** Proposal (revision 3, Track A adaptation for single-mutex model)
+**Status:** Proposal (revision 3, Track A adaptation for single-mutex model) —
+**slice 1 of 3 has shipped.** Everything below the status table is the original
+design text and still describes the full proposal, including parts that are not
+in the library. Read this table first; do not treat the sections after it as a
+description of the shipped API.
 **Audience:** ShibaDB-C library authors and consumers
-**ABI impact:** Append-only. No changes to existing `SDB_API` declarations. All new symbols are additive and covered by `SDB_ENGINE_API_VERSION = 1`.
+**ABI impact:** Append-only. No changes to existing `SDB_API` declarations. All new symbols are additive.
+
+## 0. Implementation status
+
+The shipped slice is exactly what `abi/symbols-v1.txt` lists and the
+`abi_symbols` CTest enforces. 18 new public symbols are live, declared in
+`include/shibadb_engine.h`, and covered by `tests/test_scan_enumerate.c`:
+
+| Shipped (slice 1) | Not yet implemented |
+|---|---|
+| `sdb_snapshot_open` / `_close` / `_version` | `sdb_cursor_prev`, `sdb_cursor_last` (reverse iteration) |
+| `sdb_cursor_open` / `_close` / `_options_init` | `sdb_cursor_dup`, `sdb_cursor_count` |
+| `sdb_cursor_first` / `_next` / `_seek` | `sdb_cursor_set_bounds`, `sdb_cursor_seek_exact` |
+| `sdb_cursor_valid` / `_status` / `_key` / `_value` / `_get` / `_read` | `sdb_kv_scan_range` and every `sdb_transaction_kv_scan_*` |
+| `sdb_kv_scan_prefix`, `sdb_scan_options_init` | `sdb_list_collections`, `sdb_list_indexes`, all `sdb_list_*_into` |
+| `sdb_list_namespaces` | `sdb_index_visit_range`, `sdb_collection_document_visit` |
+| forward-only, KV keyspace | blob-keyspace cursors (`SDB_KEYSPACE_BLOB` is declared but rejected) |
+
+Two corrections to the design text that follows:
+
+- The header claims `SDB_ENGINE_API_VERSION = 1`. The shipped value is **2**.
+  `SDB_ABI_VERSION` remains **1** — the two counters are independent, and only
+  the ABI counter carries the compatibility promise (see [ABI.md](ABI.md)).
+- "Forward and reverse iteration are shipped together in v1" is **not** what
+  happened. Only forward iteration shipped; reverse is a later slice.
+- `PROPOSAL_MULTI_READER_CONCURRENCY.md` (Track B), referenced below, does not
+  exist in this repository. The single-mutex Track A model is what shipped.
+
+The shipped declarations carry no compile-time experimental marker:
+`SDB_ENGINE_API_EXPERIMENTAL` is defined in `include/shibadb_engine.h` as an
+alias of `SDB_ENGINE_API_VERSION` but is referenced nowhere, so it gates
+nothing and tells a caller nothing. Experimental status is therefore prose-only
+today. Either wire the marker up or delete it rather than leave a public macro
+that looks meaningful and is not.
+
 
 **Track:** This revision targets **Track A** — shipping on the current single-recursive-mutex concurrency model without pager or WAL changes. A live `sdb_snapshot` takes the same "active-session slot" that `sdb_transaction_begin` uses today; while it is held, mutating operations on the same handle return `SDB_E_BUSY`. Track B (multi-reader with reader-floor table, freelist pinning, and per-read refcount) is a strict superset and is deferred to `PROPOSAL_MULTI_READER_CONCURRENCY.md`. The public ABI in this proposal is compatible with either track — only the internal enforcement mechanism differs.
 

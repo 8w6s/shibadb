@@ -93,3 +93,56 @@ reopened, and removed a database whose absolute path exceeded 260 characters.
 After the portability changes, the hardened Linux suite again passed 53/53 in
 784.53 seconds, including packaging. These are local development results;
 native signed Windows/macOS runs from the frozen commit are still mandatory.
+
+## Current suite state — 2026-10-01
+
+The paragraphs above are historical evidence records and are deliberately left
+as written: each describes what was run, on what build, at what date, and
+rewriting those numbers would falsify the record. This section is the
+current-state counterpart, so a reader does not have to guess which count is
+live.
+
+The build registers **71 CTest cases**. Verified on Linux, GCC 12.2, 2 cores:
+
+- `Release`: **71/71 PASS** (58.5 s).
+- GCC `Debug` with `-DSDB_ENABLE_SANITIZERS=ON` (ASan+UBSan): **70/70 PASS**
+  (253 s). The count differs by one because `release_audit` is intentionally not
+  registered for instrumented builds.
+
+Two release gates named in the checklist at the top of this file existed as
+scripts but were wired into nothing, so they were reported as satisfied while
+never running. Both are now registered CTest cases:
+
+- `abi_symbols` — compares the shared library's exported symbol set against
+  `abi/symbols-v1.txt` in both directions. Wiring it up immediately showed the
+  allowlist had gone stale by 20 symbols: the whole cursor/scan/snapshot slice
+  plus `sdb_database_migrate_file`, `sdb_list_namespaces` and
+  `sdb_version_number` were exported but unlisted. The list is now 72 symbols
+  and matches.
+- `release_reproducible` — runs `scripts/check_reproducible.py`, packaging the
+  source tree twice with a pinned epoch and comparing bytes.
+- `release_audit` — runs `scripts/release_audit.py` non-strict: forbidden
+  dependency scan, LICENSE present, symbol allowlist, `DT_NEEDED` limited to
+  libc. Registered only for production-shaped builds; under ASan the library
+  legitimately gains `libasan.so.N` and `libubsan.so.N`, so the dependency
+  assertion would be reporting the truth about the wrong artifact.
+
+Strict-mode `release_audit` still requires commit-bound native and soak evidence
+plus `gh attestation verification`, and therefore still only runs at release
+time per [`docs/RELEASE_EVIDENCE.md`](docs/RELEASE_EVIDENCE.md). That
+requirement is unchanged and unmet.
+
+### Gates that remain manual
+
+`tests/powerloss_test.sh` (dm-flakey power-loss) and `tests/powerloss_helper.c`
+are **not** registered in CTest and run in no workflow. They need root, a loop
+device and device-mapper, so they cannot run on a hosted runner. The
+5000/5000-acked-commits result quoted above is therefore reproducible only by
+hand, on a Linux host, by an operator with privileges. Until that run is
+re-executed against the exact candidate commit and its evidence recorded in the
+format `docs/RELEASE_EVIDENCE.md` specifies, treat the power-loss claim as
+unverified at this commit even though the harness exists.
+
+Likewise unchanged and still blocking: native macOS and Windows release
+evidence bound to a tagged commit, and independent cryptography /
+crash-consistency review.

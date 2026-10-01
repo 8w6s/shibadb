@@ -1,7 +1,7 @@
 # ShibaDB
 
 Embedded ACID key-value database in C11 — optional authenticated encryption, single-file,
-crash-safe, ~15k LOC, MIT-licensed.
+crash-safe, ~19.5k LOC, MIT-licensed.
 
 [![CI](https://github.com/8w6s/shibadb/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/8w6s/shibadb/actions/workflows/ci.yml)
 [![Release candidate](https://github.com/8w6s/shibadb/actions/workflows/release-candidate.yml/badge.svg?branch=main)](https://github.com/8w6s/shibadb/actions/workflows/release-candidate.yml)
@@ -51,6 +51,14 @@ during writes).
   `compare_and_swap` / `increment` counters, one-call atomic batches, and
   `sdb_index_query_documents` (find-by-field returning document bodies). See
   [examples/quickstart.c](examples/quickstart.c).
+- **Ordered iteration**: read snapshots (`sdb_snapshot_open`), forward-only
+  cursors over a namespace (`sdb_cursor_seek` / `_next` / `_key` / `_value`),
+  prefix-scan sugar (`sdb_kv_scan_prefix`) and namespace listing
+  (`sdb_list_namespaces`). This is slice 1 of the cursor/scan design — reverse
+  iteration, range scans and collection enumeration are proposed but **not yet
+  implemented**; see
+  [docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md](docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md)
+  §0 for exactly what shipped.
 - **Native CLI**: a dependency-free `shibadb` binary for KV/document access,
   `find`, `verify`, `backup`, `compact`, and scripting.
 
@@ -177,6 +185,8 @@ cc myapp.c $(pkg-config --cflags --libs shibadb) -o myapp
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — verify, backup, compact,
   migrate.
 - [docs/ABI.md](docs/ABI.md) — versioning and symbol-export policy.
+- [docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md](docs/PROPOSAL_CURSOR_SCAN_ENUMERATE.md)
+  — cursor / scan / snapshot design; §0 records which slice has shipped.
 - [docs/WINDOWS.md](docs/WINDOWS.md) — Windows build, path handling, sanitizers, and portability standard.
 
 ## Roadmap and release
