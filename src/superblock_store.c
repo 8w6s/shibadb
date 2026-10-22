@@ -147,6 +147,9 @@ sdb_status sdb_superblock_store_read_file(
     uint8_t valid_count = 0U;
     sdb_status status;
 
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     if (file == NULL || result_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
@@ -233,6 +236,9 @@ sdb_status sdb_superblock_store_read_authenticated_file(
     uint8_t selected;
     sdb_status status;
 
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     if (file == NULL || data_key == NULL || result_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
@@ -362,6 +368,9 @@ sdb_status sdb_superblock_store_read(
     sdb_file file;
     sdb_status status;
     sdb_status close_status;
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     if (path == NULL || result_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }

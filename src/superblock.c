@@ -191,6 +191,9 @@ sdb_status sdb_superblock_v1_decode(
     sdb_superblock_v1 decoded;
     size_t index;
 
+    if (superblock_out != NULL) {
+        (void)memset(superblock_out, 0, sizeof(*superblock_out));
+    }
     if (input == NULL || superblock_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }

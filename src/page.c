@@ -72,6 +72,9 @@ sdb_status sdb_page_decode(
     uint64_t page_id;
     size_t index;
 
+    if (view_out != NULL) {
+        (void)memset(view_out, 0, sizeof(*view_out));
+    }
     if (page == NULL || view_out == NULL || expected_page_id == 0U) {
         return SDB_E_INVALID_ARGUMENT;
     }

@@ -6,6 +6,7 @@
 #include "superblock_store.h"
 #include "page_cache.h"
 #include "page.h"
+#include "pager.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -179,7 +180,9 @@ static void test_page_encode_decode_bad_args(void)
     assert(view.page_lsn == 42U);
     assert(view.payload_size == sizeof(payload));
 
+    memset(&view, 0xaa, sizeof(view));
     assert(sdb_page_decode(page, 4096U, 2U, &view) == SDB_E_CORRUPT);
+    assert(view.payload == NULL && view.page_id == 0U && view.payload_size == 0U);
 
     (void)puts("page encode/decode bad args: ok");
 }
@@ -259,8 +262,10 @@ static void test_superblock_store_bad_args(void)
     sb.next_page_id = 1U;
     { size_t i; for (i = 0U; i < SDB_FILE_ID_SIZE; ++i) sb.file_id[i] = 1U; }
 
+    memset(&result, 0xaa, sizeof(result));
     assert(sdb_superblock_store_read_file(NULL, &result)
         == SDB_E_INVALID_ARGUMENT);
+    assert(result.valid_mirror_count == 0U && result.selected_slot == 0U);
 
     assert(sdb_superblock_store_create(NULL, &sb) == SDB_E_INVALID_ARGUMENT);
     assert(sdb_superblock_store_create("/tmp/x", NULL) == SDB_E_INVALID_ARGUMENT);
@@ -274,8 +279,33 @@ static void test_superblock_store_bad_args(void)
     (void)puts("superblock_store bad args: ok");
 }
 
+static void test_pager_allocate_bad_args(void)
+{
+    sdb_txn txn;
+    uint64_t page_id = 0xdeadbeefULL;
+
+    assert(sdb_pager_allocate(NULL, &page_id) == SDB_E_INVALID_ARGUMENT);
+    assert(page_id == 0U);
+
+    page_id = 0xdeadbeefULL;
+    assert(sdb_txn_allocate(NULL, &page_id) == SDB_E_INVALID_ARGUMENT);
+    assert(page_id == 0U);
+
+    memset(&txn, 0, sizeof(txn));
+    txn.active = true;
+    txn.pager = (sdb_pager *)0x1;
+    txn.target_superblock.page_size = 4096U;
+    txn.target_superblock.next_page_id = UINT64_MAX;
+    page_id = 0xdeadbeefULL;
+    assert(sdb_txn_allocate(&txn, &page_id) == SDB_E_OVERFLOW);
+    assert(page_id == 0U);
+
+    (void)puts("pager allocate bad args: ok");
+}
+
 int main(void)
 {
+    test_pager_allocate_bad_args();
     test_status_strings();
     test_version();
     test_random_bad_args();

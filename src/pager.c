@@ -1324,6 +1324,9 @@ sdb_status sdb_pager_allocate(sdb_pager *pager, uint64_t *page_id_out)
     sdb_superblock_v1 next;
     uint64_t page_id;
     sdb_status status;
+    if (page_id_out != NULL) {
+        *page_id_out = 0U;
+    }
     if (pager == NULL || !pager->open || pager->needs_recovery
         || pager->transaction_active
         || page_id_out == NULL) {
@@ -1565,6 +1568,9 @@ sdb_status sdb_txn_allocate(sdb_txn *txn, uint64_t *page_id_out)
     uint64_t next_freelist;
     uint64_t next_page_id;
     uint64_t *grown;
+    if (page_id_out != NULL) {
+        *page_id_out = 0U;
+    }
     if (txn == NULL || !txn->active || txn->pager == NULL
         || page_id_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
@@ -1636,7 +1642,10 @@ sdb_status sdb_txn_allocate(sdb_txn *txn, uint64_t *page_id_out)
         }
     } else {
         page_id = next_page_id;
-        if (page_id == UINT64_MAX) {
+        if (page_id == UINT64_MAX
+            || !sdb_page_geometry_valid(
+                page_id + 1U, txn->target_superblock.page_size
+            )) {
             return SDB_E_OVERFLOW;
         }
         next_page_id = page_id + 1U;

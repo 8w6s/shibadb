@@ -3746,6 +3746,9 @@ static sdb_status sdb_database_verify_unlocked(
     size_t capacity;
     size_t page_count;
     sdb_status status = SDB_OK;
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     if (database == NULL || !database->open || result_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
@@ -4062,6 +4065,9 @@ static sdb_status sdb_database_backup_unlocked(
     bool replacement_done = false;
     bool destination_exists = false;
     sdb_status status;
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     if (database == NULL || !database->open || destination_path == NULL
         || destination_path[0] == '\0' || result_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
@@ -4295,6 +4301,9 @@ static sdb_status sdb_database_compact_unlocked(
     uint64_t after_size = 0U;
     bool replaced = false;
     sdb_status status;
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     if (database == NULL || !database->open || result_out == NULL
         || sdb_database_options_validate(target_options) != SDB_OK) {
         return SDB_E_INVALID_ARGUMENT;
@@ -4817,6 +4826,9 @@ sdb_status sdb_database_migrate(
 )
 {
     sdb_status status;
+    if (result_out != NULL) {
+        (void)memset(result_out, 0, sizeof(*result_out));
+    }
     SDB_ENGINE_LOCK_OR_RETURN(database);
     status = target_format_version == SDB_FORMAT_VERSION_V1
         ? sdb_database_compact_unlocked(

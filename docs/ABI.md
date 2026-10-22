@@ -48,7 +48,7 @@ the Mach-O leading underscore is stripped, and only *defined external* symbols
 matching `^sdb_` are considered, which excludes synthesised runtime symbols
 (`_init`, `_fini`, `__bss_start`, `__mh_execute_header`) and keeps the gate
 correct even when it has to fall back to a plain `nm` that also lists hidden
-local functions. The dumper is resolved in the order `llvm-nm`, `nm`, `dumpbin`
+local functions. The dumper is resolved among `dumpbin`, `llvm-readobj`, `readobj`, `llvm-nm`, and `nm`
 so Linux, macOS and MSVC need no per-platform wiring; pass `-DNM=` to override
 for a cross-build.
 
