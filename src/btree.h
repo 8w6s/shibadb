@@ -50,6 +50,9 @@ typedef struct sdb_btree_cursor {
      */
     sdb_btree_path_entry path[64];
     size_t depth;
+    uint64_t *forward_visited;
+    size_t forward_visited_count;
+    size_t forward_visited_capacity;
 } sdb_btree_cursor;
 
 typedef struct sdb_btree_verify_result {

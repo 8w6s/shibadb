@@ -42,6 +42,9 @@ option(SDB_BUILD_TESTS "Build ShibaDB C tests" ON)
 option(SDB_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(SDB_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
 option(SDB_ENABLE_SOAK_TESTS "Enable long-running engine soak tests" OFF)
+option(SDB_ENABLE_WRITE_HEAVY_TESTS
+    "Enable tests that repeatedly write database files" OFF
+)
 option(SDB_BUILD_BENCHMARKS "Build the KV benchmark harness" OFF)
 option(SDB_BUILD_CLI "Build the shibadb command-line tool" ON)
 option(SDB_BUILD_EXAMPLES "Build the example programs" ON)
@@ -282,6 +285,9 @@ set_target_properties(shibadb_shared PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES
 )
+if(WIN32)
+    set_target_properties(shibadb_shared PROPERTIES PREFIX "")
+endif()
 set_target_properties(shibadb_core PROPERTIES EXPORT_NAME core)
 set_target_properties(shibadb_shared PROPERTIES EXPORT_NAME shared)
 
@@ -559,6 +565,13 @@ if(SDB_BUILD_TESTS)
     add_executable(test_encryption_fault tests/test_encryption_fault.c)
     target_include_directories(test_encryption_fault PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_encryption_fault PRIVATE ShibaDB::core)
+    add_executable(
+        test_checkpoint_encryption tests/test_checkpoint_encryption.c
+    )
+    target_include_directories(
+        test_checkpoint_encryption PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_checkpoint_encryption PRIVATE ShibaDB::core)
     add_executable(test_engine tests/test_engine.c)
     target_link_libraries(test_engine PRIVATE ShibaDB::core)
     add_executable(test_scan_enumerate tests/test_scan_enumerate.c)
@@ -631,10 +644,14 @@ if(SDB_BUILD_TESTS)
     target_link_libraries(test_compact_encryption PRIVATE ShibaDB::core)
     add_executable(test_crash_injection tests/test_crash_injection.c)
     target_link_libraries(test_crash_injection PRIVATE ShibaDB::core)
-    add_executable(test_churn_reclaim tests/test_churn_reclaim.c)
-    target_link_libraries(test_churn_reclaim PRIVATE ShibaDB::core)
-    add_executable(test_index_churn_reclaim tests/test_index_churn_reclaim.c)
-    target_link_libraries(test_index_churn_reclaim PRIVATE ShibaDB::core)
+    if(SDB_ENABLE_WRITE_HEAVY_TESTS)
+        add_executable(test_churn_reclaim tests/test_churn_reclaim.c)
+        target_link_libraries(test_churn_reclaim PRIVATE ShibaDB::core)
+        add_executable(
+            test_index_churn_reclaim tests/test_index_churn_reclaim.c
+        )
+        target_link_libraries(test_index_churn_reclaim PRIVATE ShibaDB::core)
+    endif()
     add_executable(test_legacy_index_reclaim tests/test_legacy_index_reclaim.c)
     target_include_directories(
         test_legacy_index_reclaim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -731,6 +748,9 @@ if(SDB_BUILD_TESTS)
     add_test(NAME cache_auto COMMAND test_cache_auto)
     add_test(NAME encryption COMMAND test_encryption)
     add_test(NAME encryption_fault COMMAND test_encryption_fault)
+    add_test(
+        NAME checkpoint_encryption COMMAND test_checkpoint_encryption
+    )
     add_test(NAME engine COMMAND test_engine)
     add_test(NAME scan_enumerate COMMAND test_scan_enumerate)
     add_test(NAME engine_property COMMAND test_engine_property)
@@ -765,8 +785,10 @@ if(SDB_BUILD_TESTS)
     add_test(NAME mixed_workload COMMAND test_mixed_workload)
     add_test(NAME compact_encryption COMMAND test_compact_encryption)
     add_test(NAME crash_injection COMMAND test_crash_injection)
-    add_test(NAME churn_reclaim COMMAND test_churn_reclaim)
-    add_test(NAME index_churn_reclaim COMMAND test_index_churn_reclaim)
+    if(SDB_ENABLE_WRITE_HEAVY_TESTS)
+        add_test(NAME churn_reclaim COMMAND test_churn_reclaim)
+        add_test(NAME index_churn_reclaim COMMAND test_index_churn_reclaim)
+    endif()
     add_test(NAME legacy_index_reclaim COMMAND test_legacy_index_reclaim)
     add_test(NAME group_commit_batch COMMAND test_group_commit_batch)
     add_test(

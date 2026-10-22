@@ -4480,14 +4480,6 @@ static sdb_status sdb_database_compact_unlocked(
         const sdb_status directory_status =
             sdb_file_sync_parent_directory(database->path);
         sdb_compact_test_crash(3U);
-        {
-            const sdb_status finish_status =
-                sdb_replace_finish(database->path);
-            SDB_WINDOWS_TEST_DIAG("compact replace finish", finish_status);
-            if (status == SDB_OK) {
-                status = finish_status;
-            }
-        }
         const sdb_status close_status =
             sdb_pager_close(&database->pager);
         SDB_WINDOWS_TEST_DIAG("compact source pager close", close_status);
@@ -4544,6 +4536,19 @@ static sdb_status sdb_database_compact_unlocked(
                 wal_reset_status = sdb_file_remove(source_wal_path, true);
             }
             SDB_WINDOWS_TEST_DIAG("compact adopted WAL reset", wal_reset_status);
+            if (wal_reset_status == SDB_OK) {
+                /*
+                 * Keep the replace marker until the source WAL is gone. If
+                 * reset failed, the next open must retry this cleanup before
+                 * WAL recovery sees the foreign source identity.
+                 */
+                const sdb_status finish_status =
+                    sdb_replace_finish(database->path);
+                SDB_WINDOWS_TEST_DIAG("compact replace finish", finish_status);
+                if (status == SDB_OK) {
+                    status = finish_status;
+                }
+            }
             if (status == SDB_OK) {
                 status = wal_reset_status;
             }

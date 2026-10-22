@@ -12,6 +12,17 @@ static bool sdb_is_power_of_two_u32(uint32_t value)
     return value != 0U && (value & (value - 1U)) == 0U;
 }
 
+bool sdb_page_geometry_valid(uint64_t next_page_id, uint32_t page_size)
+{
+    const uint64_t data_offset =
+        (uint64_t)(SDB_SUPERBLOCK_SLOT_SIZE * SDB_SUPERBLOCK_SLOT_COUNT);
+    if (next_page_id == 0U || page_size == 0U) {
+        return false;
+    }
+    return next_page_id - 1U
+        <= (UINT64_MAX - data_offset) / (uint64_t)page_size;
+}
+
 static bool sdb_bytes_all_zero(const uint8_t *bytes, size_t size)
 {
     uint8_t aggregate = 0U;
@@ -57,7 +68,9 @@ static sdb_sb_field sdb_validate_superblock_detailed(
             && (superblock->flags & SDB_FLAG_ENCRYPTED) == 0U)) {
         return SDB_SB_FIELD_FLAGS;
     }
-    if (superblock->next_page_id == 0U) {
+    if (!sdb_page_geometry_valid(
+            superblock->next_page_id, superblock->page_size
+        )) {
         return SDB_SB_FIELD_NEXT_PAGE_ID;
     }
     if (superblock->root_page >= superblock->next_page_id) {

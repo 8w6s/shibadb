@@ -427,12 +427,18 @@ static sdb_status sdb_pager_open_internal(
         if (status == SDB_OK
             && recovered_lsn > pager_out->superblock.checkpoint_lsn) {
             sdb_superblock_v1 next = pager_out->superblock;
-            next.checkpoint_lsn = recovered_lsn;
-            next.next_page_id = recovered_next_page_id;
-            next.freelist_page = recovered_freelist_page;
-            status = sdb_generation_bump(&next.generation);
-            if (status == SDB_OK) {
-                status = sdb_pager_store_superblock(pager_out, &next);
+            if (!sdb_page_geometry_valid(
+                    recovered_next_page_id, next.page_size
+                )) {
+                status = SDB_E_CORRUPT;
+            } else {
+                next.checkpoint_lsn = recovered_lsn;
+                next.next_page_id = recovered_next_page_id;
+                next.freelist_page = recovered_freelist_page;
+                status = sdb_generation_bump(&next.generation);
+                if (status == SDB_OK) {
+                    status = sdb_pager_store_superblock(pager_out, &next);
+                }
             }
         }
         if (status == SDB_OK) {
@@ -740,6 +746,7 @@ sdb_status sdb_pager_checkpoint(sdb_pager *pager)
     sdb_file wal;
     sdb_file *wal_ptr;
     uint8_t *frame_page;
+    uint8_t *plaintext_page = NULL;
     size_t page_size;
     size_t slot;
     bool wal_opened = false;
@@ -758,6 +765,13 @@ sdb_status sdb_pager_checkpoint(sdb_pager *pager)
     frame_page = (uint8_t *)malloc(page_size);
     if (frame_page == NULL) {
         return SDB_E_OUT_OF_MEMORY;
+    }
+    if (pager->encryption_enabled) {
+        plaintext_page = (uint8_t *)malloc(page_size);
+        if (plaintext_page == NULL) {
+            free(frame_page);
+            return SDB_E_OUT_OF_MEMORY;
+        }
     }
     /*
      * R2a Windows-safety: read frames through the ALREADY-OPEN persistent WAL
@@ -830,6 +844,22 @@ sdb_status sdb_pager_checkpoint(sdb_pager *pager)
             status = SDB_E_CORRUPT;
             break;
         }
+        if (pager->encryption_enabled) {
+            uint16_t plaintext_type;
+            size_t plaintext_size;
+            if (sdb_encrypted_page_decrypt(
+                    &pager->superblock,
+                    pager->data_key,
+                    &view,
+                    plaintext_page,
+                    page_size,
+                    &plaintext_type,
+                    &plaintext_size
+                ) != SDB_OK) {
+                status = SDB_E_CORRUPT;
+                break;
+            }
+        }
         page_offset = data_offset
             + (page_id - 1U) * (uint64_t)page_size;
         status = sdb_file_write_full(
@@ -848,6 +878,10 @@ sdb_status sdb_pager_checkpoint(sdb_pager *pager)
     }
     sdb_secure_zero(frame_page, page_size);
     free(frame_page);
+    if (plaintext_page != NULL) {
+        sdb_secure_zero(plaintext_page, page_size);
+        free(plaintext_page);
+    }
 #if SDB_TESTING
     if (status == SDB_OK && anything_applied
         && sdb_checkpoint_fail_stage_for_testing
@@ -1312,7 +1346,12 @@ sdb_status sdb_pager_allocate(sdb_pager *pager, uint64_t *page_id_out)
             status = SDB_E_CORRUPT;
         }
         if (status == SDB_OK) {
-            next.freelist_page = sdb_read_u64_le(view.payload);
+            uint64_t next_free = sdb_read_u64_le(view.payload);
+            if (next_free >= next.next_page_id || next_free == page_id) {
+                status = SDB_E_CORRUPT;
+            } else {
+                next.freelist_page = next_free;
+            }
         }
         free(page);
         if (status != SDB_OK) {
@@ -1583,7 +1622,12 @@ sdb_status sdb_txn_allocate(sdb_txn *txn, uint64_t *page_id_out)
                 status = SDB_E_CORRUPT;
             }
             if (status == SDB_OK) {
-                next_freelist = sdb_read_u64_le(view.payload);
+                uint64_t next_free = sdb_read_u64_le(view.payload);
+                if (next_free >= next_page_id || next_free == page_id) {
+                    status = SDB_E_CORRUPT;
+                } else {
+                    next_freelist = next_free;
+                }
             }
             free(page);
             if (status != SDB_OK) {
@@ -2206,6 +2250,10 @@ sdb_status sdb_pager_commit_durable(sdb_pager *pager, uint64_t txn_id)
         return SDB_E_INVALID_ARGUMENT;
     }
     sdb_mutex_lock(&pager->commit_mutex);
+    if (txn_id == 0U || txn_id > pager->written_lsn) {
+        sdb_mutex_unlock(&pager->commit_mutex);
+        return SDB_E_INVALID_ARGUMENT;
+    }
     for (;;) {
         if (pager->durable_lsn >= txn_id) {
             result = SDB_OK;

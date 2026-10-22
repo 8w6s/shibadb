@@ -234,6 +234,10 @@ static void test_invalid_configuration(void)
     }
     (void)memset(value.salt, 0, sizeof(value.salt));
     assert(sdb_superblock_v1_encode(&value, page, sizeof(page)) == SDB_E_INVALID_ARGUMENT);
+
+    value = sample_superblock();
+    value.next_page_id = UINT64_MAX;
+    assert(sdb_superblock_v1_encode(&value, page, sizeof(page)) == SDB_E_INVALID_ARGUMENT);
 }
 
 static void test_encryption_metadata_roundtrip(void)

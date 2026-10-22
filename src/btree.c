@@ -1717,6 +1717,7 @@ sdb_status sdb_btree_cursor_read(
 
 sdb_status sdb_btree_cursor_next(sdb_btree_cursor *cursor)
 {
+    size_t visited_index;
     if (cursor == NULL || cursor->tree == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
@@ -1729,6 +1730,19 @@ sdb_status sdb_btree_cursor_next(sdb_btree_cursor *cursor)
     {
         uint64_t hops = 0U;
         const uint64_t limit = cursor->tree->pager->superblock.next_page_id;
+        if (cursor->forward_visited_count == 0U) {
+            cursor->forward_visited_capacity = 8U;
+            cursor->forward_visited = (uint64_t *)malloc(
+                cursor->forward_visited_capacity
+                    * sizeof(*cursor->forward_visited)
+            );
+            if (cursor->forward_visited == NULL) {
+                cursor->valid = false;
+                return SDB_E_OUT_OF_MEMORY;
+            }
+            cursor->forward_visited[0] = cursor->page_id;
+            cursor->forward_visited_count = 1U;
+        }
         for (;;) {
             const uint64_t sibling = cursor->leaf.right_sibling;
             sdb_btree_node next;
@@ -1737,7 +1751,15 @@ sdb_status sdb_btree_cursor_next(sdb_btree_cursor *cursor)
                 cursor->valid = false;
                 return SDB_OK;
             }
-            if (sibling == cursor->page_id || ++hops >= limit) {
+            for (visited_index = 0U;
+                 visited_index < cursor->forward_visited_count;
+                 ++visited_index) {
+                if (cursor->forward_visited[visited_index] == sibling) {
+                    cursor->valid = false;
+                    return SDB_E_CORRUPT;
+                }
+            }
+            if (++hops >= limit) {
                 cursor->valid = false;
                 return SDB_E_CORRUPT;
             }
@@ -1755,6 +1777,30 @@ sdb_status sdb_btree_cursor_next(sdb_btree_cursor *cursor)
             cursor->leaf = next;
             cursor->page_id = sibling;
             cursor->index = 0U;
+            if (cursor->forward_visited_count
+                == cursor->forward_visited_capacity) {
+                uint64_t *grown;
+                size_t next_capacity;
+                if (cursor->forward_visited_capacity
+                    > SIZE_MAX / (2U * sizeof(*cursor->forward_visited))) {
+                    cursor->valid = false;
+                    return SDB_E_OVERFLOW;
+                }
+                next_capacity = cursor->forward_visited_capacity * 2U;
+                grown = (uint64_t *)realloc(
+                    cursor->forward_visited,
+                    next_capacity * sizeof(*cursor->forward_visited)
+                );
+                if (grown == NULL) {
+                    cursor->valid = false;
+                    return SDB_E_OUT_OF_MEMORY;
+                }
+                cursor->forward_visited = grown;
+                cursor->forward_visited_capacity = next_capacity;
+            }
+            cursor->forward_visited[
+                cursor->forward_visited_count++
+            ] = sibling;
             if (next.count != 0U) {
                 cursor->valid = true;
                 return SDB_OK;
@@ -1822,6 +1868,10 @@ sdb_status sdb_btree_cursor_prev(sdb_btree_cursor *cursor)
     if (cursor == NULL || cursor->tree == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
+    free(cursor->forward_visited);
+    cursor->forward_visited = NULL;
+    cursor->forward_visited_count = 0U;
+    cursor->forward_visited_capacity = 0U;
     /*
      * index > 0 covers both a positioned cursor stepping back and a cursor a
      * seek left past the end of this leaf (index == count): index - 1 is the
@@ -1876,6 +1926,7 @@ void sdb_btree_cursor_close(sdb_btree_cursor *cursor)
 {
     if (cursor != NULL) {
         sdb_btree_node_destroy(&cursor->leaf);
+        free(cursor->forward_visited);
         (void)memset(cursor, 0, sizeof(*cursor));
     }
 }

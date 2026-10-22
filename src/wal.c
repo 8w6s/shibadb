@@ -892,7 +892,10 @@ sdb_status sdb_wal_recover(
                 return SDB_E_CORRUPT;
             }
         }
-        if (target_next_page_id < superblock->next_page_id
+        if (!sdb_page_geometry_valid(
+                target_next_page_id, superblock->page_size
+            )
+            || target_next_page_id < superblock->next_page_id
             || target_freelist_page >= target_next_page_id) {
             free(buffer);
             return SDB_E_CORRUPT;
@@ -1091,6 +1094,11 @@ sdb_status sdb_wal_recover_all(
         || page_size > (size_t)SDB_MAX_PAGE_SIZE
         || (page_size & (page_size - 1U)) != 0U) {
         return SDB_E_INVALID_ARGUMENT;
+    }
+    if (!sdb_page_geometry_valid(
+            superblock->next_page_id, superblock->page_size
+        )) {
+        return SDB_E_CORRUPT;
     }
     frame_size = sdb_wal_frame_size(page_size);
 
@@ -1418,7 +1426,10 @@ sdb_status sdb_wal_recover_all(
                     break;
                 }
                 /* Freelist / next_page_id must be sane. */
-                if (rec.next_page_id < target_next_page_id
+                if (!sdb_page_geometry_valid(
+                        rec.next_page_id, superblock->page_size
+                    )
+                    || rec.next_page_id < target_next_page_id
                     || (rec.freelist_page != 0U
                         && rec.freelist_page >= rec.next_page_id)) {
                     torn = true;

@@ -1,4 +1,5 @@
 #include "pager.h"
+#include "superblock_store.h"
 #include "wal.h"
 #include "page.h"
 #include "file.h"
@@ -217,10 +218,66 @@ static void test_recovery_applies_valid_encrypted_frame(void)
     (void)puts("wal recovery: valid ENCRYPTED frame applied ok");
 }
 
+static void test_recovery_rejects_unrepresentable_geometry(void)
+{
+    sdb_pager pager;
+    sdb_superblock_v1 snapshot;
+    uint8_t salt[SDB_SALT_SIZE];
+    uint8_t file_id[SDB_FILE_ID_SIZE];
+    uint8_t page[4096];
+    uint64_t page_id;
+    sdb_wal_page wal_page;
+    sdb_file wal;
+    uint64_t new_offset = 0U;
+    uint64_t txn_id;
+
+    memset(salt, 0x71, sizeof(salt));
+    memset(file_id, 0x82, sizeof(file_id));
+    cleanup();
+    assert(sdb_pager_create(
+        test_path, 4096U, salt, file_id, &pager
+    ) == SDB_OK);
+    assert(sdb_pager_allocate(&pager, &page_id) == SDB_OK);
+    assert(sdb_pager_write(
+        &pager, page_id, (uint16_t)SDB_PAGE_TYPE_DATA, 0U,
+        original_payload, sizeof(original_payload)
+    ) == SDB_OK);
+    snapshot = pager.superblock;
+    assert(sdb_pager_close(&pager) == SDB_OK);
+
+    assert(sdb_page_encode(
+        page, sizeof(page), (uint16_t)SDB_PAGE_TYPE_DATA, page_id,
+        snapshot.checkpoint_lsn + 1U, forged_payload, sizeof(forged_payload)
+    ) == SDB_OK);
+    {
+        sdb_superblock_v1 forged = snapshot;
+        forged.next_page_id = UINT64_MAX;
+        forged.freelist_page = 0U;
+        wal_page.page_id = page_id;
+        wal_page.bytes = page;
+        txn_id = snapshot.checkpoint_lsn + 1U;
+        assert(sdb_file_create_new(wal_path, &wal) == SDB_OK);
+        assert(sdb_wal_append_txn(
+            &wal, SDB_WAL_HEADER_SIZE, &forged, txn_id,
+            &wal_page, 1U, &new_offset
+        ) == SDB_OK);
+        assert(sdb_file_close(&wal) == SDB_OK);
+    }
+
+    assert(sdb_pager_open(test_path, &pager) == SDB_E_CORRUPT);
+    (void)remove(wal_path);
+    assert(sdb_pager_open(test_path, &pager) == SDB_OK);
+    assert(pager.superblock.next_page_id == snapshot.next_page_id);
+    assert(sdb_pager_close(&pager) == SDB_OK);
+    cleanup();
+    (void)puts("wal recovery: unrepresentable geometry rejected ok");
+}
+
 int main(void)
 {
     test_recovery_rejects_forged_nonencrypted_frame();
     test_recovery_applies_valid_encrypted_frame();
+    test_recovery_rejects_unrepresentable_geometry();
     (void)puts("all wal_recover_forge tests passed");
     return 0;
 }

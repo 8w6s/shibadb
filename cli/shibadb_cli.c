@@ -19,6 +19,7 @@
 #include <shibadb.h>
 #include <shibadb_engine.h>
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -67,6 +68,7 @@ static const char *entries_word(uint64_t count)
 
 typedef struct cli_options {
     const char *password;   /* NULL when none supplied */
+    char *password_heap;    /* scrubbed copy on heap */
     uint32_t page_size;     /* 0 = engine default */
     uint32_t kdf_iterations;/* 0 = engine default */
     const char *prefix;     /* scan prefix, NULL = whole namespace */
@@ -80,6 +82,7 @@ typedef struct cli_options {
 
 static void cli_options_init(cli_options *opts) {
     opts->password = NULL;
+    opts->password_heap = NULL;
     opts->page_size = 0U;
     opts->kdf_iterations = 0U;
     opts->prefix = NULL;
@@ -88,6 +91,18 @@ static void cli_options_init(cli_options *opts) {
     opts->force = false;
     opts->unique = false;
     opts->index_count = 0U;
+}
+
+static void cli_options_cleanup(cli_options *opts) {
+    if (opts->password_heap != NULL) {
+        volatile char *p = (volatile char *)opts->password_heap;
+        while (*p != '\0') {
+            *p++ = '\0';
+        }
+        free(opts->password_heap);
+        opts->password_heap = NULL;
+    }
+    opts->password = NULL;
 }
 
 /*
@@ -109,8 +124,9 @@ static int cli_parse_u32(const char *text, uint32_t *out, const char *flag) {
     if (text == NULL || text[0] == '\0') {
         goto bad;
     }
+    errno = 0;
     value = strtoull(text, &end, 10);
-    if (end == text || *end != '\0' || value > 0xFFFFFFFFULL) {
+    if (errno == ERANGE || end == text || *end != '\0' || value > 0xFFFFFFFFULL) {
         goto bad;
     }
     *out = (uint32_t)value;
@@ -128,11 +144,33 @@ static int cli_parse_u64(const char *text, uint64_t *out, const char *flag) {
     if (text == NULL || text[0] == '\0') {
         goto bad;
     }
+    errno = 0;
     value = strtoull(text, &end, 10);
-    if (end == text || *end != '\0') {
+    if (errno == ERANGE || end == text || *end != '\0' || value > UINT64_MAX) {
         goto bad;
     }
     *out = (uint64_t)value;
+    return 0;
+bad:
+    fprintf(stderr, "shibadb: %s requires an integer value, got '%s'\n",
+            flag, text != NULL ? text : "");
+    return -1;
+}
+
+static int cli_parse_i64(const char *text, int64_t *out, const char *flag) {
+    char *end = NULL;
+    long long value;
+
+    if (text == NULL || text[0] == '\0') {
+        goto bad;
+    }
+    errno = 0;
+    value = strtoll(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0'
+        || value < INT64_MIN || value > INT64_MAX) {
+        goto bad;
+    }
+    *out = (int64_t)value;
     return 0;
 bad:
     fprintf(stderr, "shibadb: %s requires an integer value, got '%s'\n",
@@ -150,7 +188,28 @@ static int cli_parse_options(int argc, char **argv, cli_options *opts,
                 fprintf(stderr, "shibadb: %s requires a value\n", arg);
                 return -1;
             }
-            opts->password = argv[++i];
+            if (opts->password_heap != NULL) {
+                cli_options_cleanup(opts);
+            }
+            char *raw_pw = argv[++i];
+            size_t pw_len = strlen(raw_pw);
+            opts->password_heap = (char *)malloc(pw_len + 1);
+            if (opts->password_heap == NULL) {
+                fprintf(stderr, "shibadb: out of memory\n");
+                return -1;
+            }
+            memcpy(opts->password_heap, raw_pw, pw_len + 1);
+            opts->password = opts->password_heap;
+
+            /*
+             * Overwrite password in argv to prevent local process snooping
+             * via process table (CWE-214).
+             */
+            memset(raw_pw, '*', pw_len);
+            fprintf(stderr,
+                    "shibadb: warning: passing password via '%s' exposes it in "
+                    "process table; consider SHIBADB_PASSWORD environment variable\n",
+                    arg);
         } else if (strcmp(arg, "--prefix") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "shibadb: --prefix requires a value\n");
@@ -668,8 +727,8 @@ static int cmd_docput(const char *path, const char *collection, const char *id,
     for (i = 0; i < opts->index_count; ++i) {
         const char *spec = opts->index_specs[i];
         const char *eq = strchr(spec, '=');
-        if (eq == NULL) {
-            fprintf(stderr, "shibadb: --index expects name=value, got '%s'\n",
+        if (eq == NULL || eq == spec || *(eq + 1) == '\0') {
+            fprintf(stderr, "shibadb: --index expects name=value with non-empty name and value, got '%s'\n",
                     spec);
             return 1;
         }
@@ -941,6 +1000,7 @@ int main(int argc, char **argv) {
     if (rest_argc > 0 &&
         cli_parse_options(rest_argc, &argv[2], &opts, pos, &npos) != 0) {
         free(pos);
+        cli_options_cleanup(&opts);
         return 1;
     }
 
@@ -981,8 +1041,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "incr") == 0) {
         if (npos != 3 && npos != 4) { fprintf(stderr, "shibadb: incr <file> <ns> <k> [delta]\n"); rc = 1; }
         else {
-            int64_t delta = (npos == 4) ? (int64_t)strtoll(pos[3], NULL, 10) : 1;
-            rc = cmd_incr(pos[0], pos[1], pos[2], delta, &opts);
+            int64_t delta = 1;
+            if (npos == 4 && cli_parse_i64(pos[3], &delta, "incr") != 0) {
+                rc = 1;
+            } else {
+                rc = cmd_incr(pos[0], pos[1], pos[2], delta, &opts);
+            }
         }
     } else if (strcmp(cmd, "mkindex") == 0) {
         if (npos != 3) { fprintf(stderr, "shibadb: mkindex <file> <coll> <name>\n"); rc = 1; }
@@ -1012,5 +1076,6 @@ int main(int argc, char **argv) {
     }
 
     free(pos);
+    cli_options_cleanup(&opts);
     return rc;
 }

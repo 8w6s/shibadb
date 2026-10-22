@@ -124,6 +124,12 @@ run(0 out get "${ENC}" s k1 --password "${PW}")
 if(NOT out STREQUAL "topsecret")
     message(FATAL_ERROR "encrypted get: '${out}'")
 endif()
+# repeated password flag overrides earlier value cleanly without leaking
+run(0 out put "${ENC}" s k2 topsecret2 --password dummy -p "${PW}")
+run(0 out get "${ENC}" s k2 -p dummy --password "${PW}")
+if(NOT out STREQUAL "topsecret2")
+    message(FATAL_ERROR "encrypted get repeated password: '${out}'")
+endif()
 # wrong password fails
 run(2 out get "${ENC}" s k1 --password wrong)
 # info without password reports encryption

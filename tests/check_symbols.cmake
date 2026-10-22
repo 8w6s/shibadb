@@ -38,9 +38,9 @@ endif()
 # binutils.
 if(NOT DEFINED NM OR NM STREQUAL "")
     if(CMAKE_HOST_WIN32 OR WIN32)
-        set(sdb_dumper_candidates dumpbin llvm-nm nm)
+        set(sdb_dumper_candidates dumpbin llvm-readobj readobj llvm-nm nm)
     else()
-        set(sdb_dumper_candidates llvm-nm nm dumpbin)
+        set(sdb_dumper_candidates llvm-nm nm dumpbin llvm-readobj readobj)
     endif()
     foreach(sdb_candidate IN LISTS sdb_dumper_candidates)
         find_program(SDB_DUMPER_${sdb_candidate} ${sdb_candidate})
@@ -52,14 +52,15 @@ if(NOT DEFINED NM OR NM STREQUAL "")
 endif()
 if(NOT DEFINED NM OR NM STREQUAL "")
     message(FATAL_ERROR
-        "No symbol dumper found (searched: llvm-nm, nm, dumpbin). "
+        "No symbol dumper found (searched: llvm-nm, nm, dumpbin, llvm-readobj). "
         "Pass -DNM=<tool> to run the ABI symbol gate."
     )
 endif()
 get_filename_component(sdb_nm_name "${NM}" NAME)
 
 # GNU/llvm nm accept -D --defined-only on ELF; Apple's cctools nm rejects
-# -D and wants -gU; MSVC DLLs use dumpbin /EXPORTS. Each
+# -D and wants -gU; MSVC DLLs use dumpbin /EXPORTS; LLVM on Windows uses
+# llvm-readobj --coff-exports to inspect the PE export directory. Each
 # style is tried until one exits 0 AND its output mentions an sdb_ symbol, so a
 # tool that accepts a flag but misreads the format falls through instead of
 # silently yielding an empty set -- an empty set would otherwise look like a
@@ -76,6 +77,16 @@ if(sdb_nm_name MATCHES "dumpbin")
     )
     if(sdb_nm_status EQUAL 0 AND sdb_nm_output MATCHES "sdb_")
         set(sdb_dump_style "dumpbin")
+    endif()
+elseif(sdb_nm_name MATCHES "readobj")
+    execute_process(
+        COMMAND "${NM}" --coff-exports "${LIBRARY}"
+        RESULT_VARIABLE sdb_nm_status
+        OUTPUT_VARIABLE sdb_nm_output
+        ERROR_VARIABLE sdb_nm_error
+    )
+    if(sdb_nm_status EQUAL 0 AND sdb_nm_output MATCHES "sdb_")
+        set(sdb_dump_style "readobj")
     endif()
 else()
     foreach(sdb_style "-D;--defined-only" "-gU" "--dynamic;--defined-only" "")
@@ -110,6 +121,11 @@ foreach(line IN LISTS sdb_nm_lines)
     if(sdb_dump_style STREQUAL "dumpbin")
         # dumpbin /EXPORTS rows: ordinal hint RVA name [forwarder]
         if(line MATCHES "^[ \t]*[0-9]+[ \t]+[0-9A-Fa-f]+[ \t]+[0-9A-Fa-f]+[ \t]+([A-Za-z_][A-Za-z0-9_]*)")
+            list(APPEND actual "${CMAKE_MATCH_1}")
+        endif()
+    elseif(sdb_dump_style STREQUAL "readobj")
+        # llvm-readobj --coff-exports rows: Name: <symbol>
+        if(line MATCHES "^[ \t]*Name:[ \t]+([A-Za-z_][A-Za-z0-9_]*)")
             list(APPEND actual "${CMAKE_MATCH_1}")
         endif()
     elseif(line MATCHES "[ \t]([A-Za-z])[ \t]+([A-Za-z_][A-Za-z0-9_]*)$")

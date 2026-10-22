@@ -21,6 +21,7 @@ extern const uint8_t sdb_superblock_magic[SDB_SUPERBLOCK_MAGIC_SIZE];
 
 bool sdb_checked_add_size(size_t left, size_t right, size_t *result);
 bool sdb_checked_mul_size(size_t left, size_t right, size_t *result);
+bool sdb_page_geometry_valid(uint64_t next_page_id, uint32_t page_size);
 
 uint16_t sdb_read_u16_le(const uint8_t *input);
 uint32_t sdb_read_u32_le(const uint8_t *input);

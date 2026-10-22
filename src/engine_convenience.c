@@ -82,6 +82,7 @@ sdb_status sdb_kv_exists(
     if (exists_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
+    *exists_out = false;
     status = sdb_kv_get(
         database, namespace_name, namespace_size, key, key_size,
         NULL, 0U, &needed
@@ -127,6 +128,7 @@ sdb_status sdb_kv_count_prefix(
     if (count_out == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
+    *count_out = 0U;
     status = sdb_kv_scan_prefix(
         database, namespace_name, namespace_size, prefix, prefix_size,
         NULL, sdb_convenience_count_visitor, &total, NULL
@@ -260,6 +262,9 @@ sdb_status sdb_kv_increment(
 )
 {
     sdb_transaction *txn = NULL;
+    if (new_value_out != NULL) {
+        *new_value_out = 0;
+    }
     uint8_t buffer[8];
     size_t got = 0U;
     int64_t current = 0;
@@ -381,6 +386,7 @@ typedef struct sdb_index_id_collector {
     size_t count;
     size_t capacity;
     bool out_of_memory;
+    bool overflow;
 } sdb_index_id_collector;
 
 static bool sdb_index_collect_visitor(
@@ -393,8 +399,20 @@ static bool sdb_index_collect_visitor(
         return false;
     }
     if (collector->count == collector->capacity) {
-        size_t new_capacity =
-            collector->capacity == 0U ? 8U : collector->capacity * 2U;
+        size_t new_capacity;
+        if (collector->capacity == 0U) {
+            new_capacity = 8U;
+        } else {
+            if (collector->capacity > SIZE_MAX / 2U) {
+                collector->overflow = true;
+                return false;
+            }
+            new_capacity = collector->capacity * 2U;
+        }
+        if (new_capacity > SIZE_MAX / sizeof(*collector->items)) {
+            collector->overflow = true;
+            return false;
+        }
         sdb_collected_id *grown = (sdb_collected_id *)realloc(
             collector->items, new_capacity * sizeof(*grown)
         );
@@ -437,6 +455,9 @@ sdb_status sdb_index_query_documents(
     size_t emitted = 0U;
     size_t index;
     size_t visit_count = 0U;
+    if (match_count_out != NULL) {
+        *match_count_out = 0U;
+    }
     if (visitor == NULL) {
         return SDB_E_INVALID_ARGUMENT;
     }
@@ -444,6 +465,7 @@ sdb_status sdb_index_query_documents(
     collector.count = 0U;
     collector.capacity = 0U;
     collector.out_of_memory = false;
+    collector.overflow = false;
 
     /*
      * Phase 1: collect matching document ids. The visitor only copies bytes,
@@ -456,6 +478,8 @@ sdb_status sdb_index_query_documents(
     );
     if (status == SDB_OK && collector.out_of_memory) {
         status = SDB_E_OUT_OF_MEMORY;
+    } else if (status == SDB_OK && collector.overflow) {
+        status = SDB_E_OVERFLOW;
     }
 
     /* Phase 2: the lock is released; fetch each body and hand it to caller. */
@@ -463,39 +487,57 @@ sdb_status sdb_index_query_documents(
         size_t needed = 0U;
         size_t capacity;
         size_t got = 0U;
-        uint8_t *body;
+        uint8_t *body = NULL;
         bool keep_going;
-        sdb_status read = sdb_document_get(
-            database, collection, collection_size,
-            collector.items[index].bytes, collector.items[index].size,
-            NULL, 0U, &needed
-        );
-        if (read == SDB_E_NOT_FOUND) {
-            continue; /* deleted between the two phases */
-        }
-        if (read != SDB_OK && read != SDB_E_BUFFER_TOO_SMALL) {
-            status = read;
+        for (;;) {
+            sdb_status read = sdb_document_get(
+                database, collection, collection_size,
+                collector.items[index].bytes, collector.items[index].size,
+                NULL, 0U, &needed
+            );
+            if (read == SDB_E_NOT_FOUND) {
+                body = NULL;
+                break; /* deleted between the two phases */
+            }
+            if (read != SDB_OK && read != SDB_E_BUFFER_TOO_SMALL) {
+                status = read;
+                body = NULL;
+                break;
+            }
+            capacity = needed == 0U ? 1U : needed;
+            body = (uint8_t *)malloc(capacity);
+            if (body == NULL) {
+                status = SDB_E_OUT_OF_MEMORY;
+                break;
+            }
+            read = sdb_document_get(
+                database, collection, collection_size,
+                collector.items[index].bytes, collector.items[index].size,
+                body, capacity, &got
+            );
+            if (read == SDB_E_BUFFER_TOO_SMALL) {
+                /* A concurrent writer grew the document; retry with the new size. */
+                free(body);
+                continue;
+            }
+            if (read == SDB_E_NOT_FOUND) {
+                free(body);
+                body = NULL;
+                break;
+            }
+            if (read != SDB_OK) {
+                free(body);
+                body = NULL;
+                status = read;
+                break;
+            }
             break;
         }
-        capacity = needed == 0U ? 1U : needed;
-        body = (uint8_t *)malloc(capacity);
+        if (status != SDB_OK) {
+            break;
+        }
         if (body == NULL) {
-            status = SDB_E_OUT_OF_MEMORY;
-            break;
-        }
-        read = sdb_document_get(
-            database, collection, collection_size,
-            collector.items[index].bytes, collector.items[index].size,
-            body, capacity, &got
-        );
-        if (read == SDB_E_NOT_FOUND) {
-            free(body);
             continue;
-        }
-        if (read != SDB_OK) {
-            free(body);
-            status = read;
-            break;
         }
         keep_going = visitor(
             context, collector.items[index].bytes,

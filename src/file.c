@@ -127,13 +127,15 @@ sdb_status sdb_file_open_existing(const char *path, bool writable, sdb_file *fil
 
 sdb_status sdb_file_close(sdb_file *file)
 {
+    HANDLE handle;
     if (file == NULL || file->handle == INVALID_HANDLE_VALUE) {
         return SDB_E_INVALID_ARGUMENT;
     }
-    if (!CloseHandle(file->handle)) {
+    handle = file->handle;
+    file->handle = INVALID_HANDLE_VALUE;
+    if (!CloseHandle(handle)) {
         return SDB_E_IO;
     }
-    file->handle = INVALID_HANDLE_VALUE;
     return SDB_OK;
 }
 
@@ -426,7 +428,8 @@ sdb_status sdb_file_remove(const char *path, bool missing_ok)
     }
     error = GetLastError();
     free(wide_path);
-    return missing_ok && error == ERROR_FILE_NOT_FOUND
+    return missing_ok
+        && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
         ? SDB_OK : SDB_E_IO;
 }
 

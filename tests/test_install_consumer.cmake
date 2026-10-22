@@ -52,10 +52,16 @@ if(WIN32)
     set(shared_executable "${consumer_bindir}/consumer_shared.exe")
     set(static_executable "${consumer_bindir}/consumer_static.exe")
     set(cpp_executable "${consumer_bindir}/consumer_cpp.exe")
-    # The shared consumer links shibadb.dll, installed to <prefix>/bin. Windows
-    # has no rpath; the loader searches the executable's own directory first, so
-    # stage the DLL beside the consumer rather than mutating PATH.
-    file(COPY "${INSTALL_PREFIX}/bin/shibadb.dll" DESTINATION "${consumer_bindir}")
+    # The shared consumer links shibadb.dll (or libshibadb.dll with MinGW),
+    # installed to <prefix>/bin. Windows has no rpath; the loader searches the
+    # executable's own directory first, so stage the DLL beside the consumer
+    # rather than mutating PATH.
+    if(EXISTS "${INSTALL_PREFIX}/bin/shibadb.dll")
+        file(COPY "${INSTALL_PREFIX}/bin/shibadb.dll" DESTINATION "${consumer_bindir}")
+    endif()
+    if(EXISTS "${INSTALL_PREFIX}/bin/libshibadb.dll")
+        file(COPY "${INSTALL_PREFIX}/bin/libshibadb.dll" DESTINATION "${consumer_bindir}")
+    endif()
 else()
     set(shared_executable "${consumer_build}/consumer_shared")
     set(static_executable "${consumer_build}/consumer_static")
